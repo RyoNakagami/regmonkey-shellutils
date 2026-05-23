@@ -3,15 +3,11 @@ meta-data:
   visibility: public
   org-name: RyoNakagami
   tag:
-    - github
-    - gitignore
-    - template
+    - shellutils
+    - shellscript
     - command-line-tool
     - cli-tool
-    - LICENSE
-    - blog
-    - Python
   description: |
-    xxxxx
+    A collection of shell utilities for various tasks, including file management, text processing, and system monitoring. These tools are designed to enhance productivity and simplify common command-line operations.
   homepage: null
   license: mit
