@@ -1,0 +1,17 @@
+meta-data:
+  repository_name: regmonkey-shellutils
+  visibility: public
+  org-name: RyoNakagami
+  tag:
+    - github
+    - gitignore
+    - template
+    - command-line-tool
+    - cli-tool
+    - LICENSE
+    - blog
+    - Python
+  description: |
+    xxxxx
+  homepage: null
+  license: mit

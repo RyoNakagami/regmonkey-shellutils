@@ -1,0 +1,68 @@
+name: Post Pull Request Processing
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed  # PR closure event
+
+permissions:
+  contents: write
+
+jobs:
+  post_merge:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # -------------------------------
+      # Step 1: Install Install jq + uv + yamlcli
+      # -------------------------------
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: false
+
+      - name: "Install yamlcli via uv tool"
+        run: |
+          uv tool install git+https://github.com/RyoNakagami/yamlcli.git
+
+      # -------------------------------
+      # Step 2: Create Git tag from pyproject.toml
+      # -------------------------------
+      - name: Extract version from project.yml
+        id: get_version
+        run: |
+          VERSION=$(yamlcli project.yml --to-json | jq -r '.["version"]')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      # -------------------------------
+      # Step 3: Create Git tag and Release
+      # -------------------------------
+      - name: Tag main branch
+        run: |
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+
+      - name: Create GitHub Release with notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v$VERSION" \
+            --generate-notes

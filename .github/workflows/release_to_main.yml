@@ -1,0 +1,107 @@
+name: Auto-merge release into main
+
+# Trigger: Runs whenever a release/vX.Y.x branch is updated (i.e. something was
+# merged into it). Opens or updates a PR to main and enables auto-merge so the
+# changes land on main without manual PR creation.
+on:
+  push:
+    branches:
+      - 'release/v[0-9]+.[0-9]+.x'
+
+# Minimal required permissions
+permissions:
+  contents: write        # needed for merge
+  pull-requests: write   # create / update / enable auto-merge on the PR
+
+jobs:
+  promote-to-main:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          # Need full history so we can compare release branch with main
+          fetch-depth: 0
+
+      - name: Authenticate GitHub CLI
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+
+      # ============================================================
+      # CHECK: Anything to merge?
+      # ============================================================
+
+      - name: Check release branch is ahead of main
+        id: diff
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          # Make sure we have the latest main reference
+          git fetch origin main --quiet
+
+          AHEAD=$(git rev-list --count "origin/main..origin/${BRANCH}")
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "ahead=${AHEAD}"   >> "$GITHUB_OUTPUT"
+          echo "::notice::${BRANCH} is ${AHEAD} commits ahead of main"
+
+      # ============================================================
+      # PR: Open new or reuse existing PR from release → main
+      # ============================================================
+
+      - name: Open or reuse PR to main
+        id: pr
+        if: steps.diff.outputs.ahead != '0'
+        env:
+          BRANCH: ${{ steps.diff.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          # Reuse an existing open PR if one already targets main from this branch
+          PR_NUMBER=$(gh pr list \
+            --base main \
+            --head "${BRANCH}" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [[ -z "${PR_NUMBER}" ]]; then
+            echo "Creating new PR from ${BRANCH} into main"
+            PR_URL=$(gh pr create \
+              --base main \
+              --head "${BRANCH}" \
+              --title "Promote ${BRANCH} to main" \
+              --body "$(cat <<EOF
+          Auto-generated PR. Promotes the latest state of \`${BRANCH}\` to \`main\`.
+
+          Triggered by push to \`${BRANCH}\` (commit \`${GITHUB_SHA}\`).
+          EOF
+          )")
+            PR_NUMBER=$(basename "${PR_URL}")
+          else
+            echo "Reusing existing PR #${PR_NUMBER} for ${BRANCH} → main"
+          fi
+
+          echo "number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # MERGE: Enable auto-merge; fall back to immediate merge
+      # ============================================================
+
+      - name: Enable auto-merge (or merge immediately if no checks)
+        if: steps.diff.outputs.ahead != '0'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+
+          # Try auto-merge first; this waits for required status checks if any.
+          if gh pr merge "${PR_NUMBER}" --auto --merge; then
+            echo "Auto-merge enabled for PR #${PR_NUMBER}"
+          else
+            # Auto-merge requires the feature enabled and at least one required
+            # check on main. If unavailable, merge straight away.
+            echo "Auto-merge unavailable; attempting immediate merge"
+            gh pr merge "${PR_NUMBER}" --merge --admin || \
+              gh pr merge "${PR_NUMBER}" --merge
+          fi
