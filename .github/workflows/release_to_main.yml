@@ -1,107 +1,73 @@
-name: Auto-merge release into main
+name: Tag and Release on Merge
 
-# Trigger: Runs whenever a release/vX.Y.x branch is updated (i.e. something was
-# merged into it). Opens or updates a PR to main and enables auto-merge so the
-# changes land on main without manual PR creation.
 on:
-  push:
+  pull_request:
+    types:
+      - closed
     branches:
-      - 'release/v[0-9]+.[0-9]+.x'
+      - main
 
-# Minimal required permissions
 permissions:
-  contents: write        # needed for merge
-  pull-requests: write   # create / update / enable auto-merge on the PR
+  contents: write
 
 jobs:
-  promote-to-main:
+  release:
+    if: >
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'release')
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v4
         with:
-          # Need full history so we can compare release branch with main
           fetch-depth: 0
+          ref: main
 
-      - name: Authenticate GitHub CLI
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
-
-      # ============================================================
-      # CHECK: Anything to merge?
-      # ============================================================
-
-      - name: Check release branch is ahead of main
-        id: diff
+      - name: Extract version from Cargo.toml
+        id: version
         run: |
-          set -euo pipefail
+          VERSION=$(cat VERSION)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}"    >> "$GITHUB_OUTPUT"
 
-          BRANCH="${GITHUB_REF#refs/heads/}"
-          # Make sure we have the latest main reference
-          git fetch origin main --quiet
-
-          AHEAD=$(git rev-list --count "origin/main..origin/${BRANCH}")
-          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
-          echo "ahead=${AHEAD}"   >> "$GITHUB_OUTPUT"
-          echo "::notice::${BRANCH} is ${AHEAD} commits ahead of main"
-
-      # ============================================================
-      # PR: Open new or reuse existing PR from release → main
-      # ============================================================
-
-      - name: Open or reuse PR to main
-        id: pr
-        if: steps.diff.outputs.ahead != '0'
-        env:
-          BRANCH: ${{ steps.diff.outputs.branch }}
+      - name: Abort if tag already exists
         run: |
-          set -euo pipefail
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Tag ${{ steps.version.outputs.tag }} already exists. Aborting."
+            exit 1
+          fi
 
-          # Reuse an existing open PR if one already targets main from this branch
-          PR_NUMBER=$(gh pr list \
-            --base main \
-            --head "${BRANCH}" \
-            --state open \
-            --json number \
-            --jq '.[0].number // empty')
-
-          if [[ -z "${PR_NUMBER}" ]]; then
-            echo "Creating new PR from ${BRANCH} into main"
-            PR_URL=$(gh pr create \
-              --base main \
-              --head "${BRANCH}" \
-              --title "Promote ${BRANCH} to main" \
-              --body "$(cat <<EOF
-          Auto-generated PR. Promotes the latest state of \`${BRANCH}\` to \`main\`.
-
-          Triggered by push to \`${BRANCH}\` (commit \`${GITHUB_SHA}\`).
+      - name: Verify CHANGELOG entry and extract release notes
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          version = "${{ steps.version.outputs.version }}"
+          changelog = open("CHANGELOG.md").read()
+          pattern = rf"## \[{re.escape(version)}\].*?(?=\n## |\Z)"
+          match = re.search(pattern, changelog, re.DOTALL)
+          if not match:
+              print(
+                  f"ERROR: No CHANGELOG entry found for version {version}. "
+                  "Add a '## [{version}]' section to CHANGELOG.md before releasing.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          notes = match.group(0).strip()
+          open("release_notes.md", "w").write(notes)
+          print(f"Found release notes for v{version}")
           EOF
-          )")
-            PR_NUMBER=$(basename "${PR_URL}")
-          else
-            echo "Reusing existing PR #${PR_NUMBER} for ${BRANCH} → main"
-          fi
 
-          echo "number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
-
-      # ============================================================
-      # MERGE: Enable auto-merge; fall back to immediate merge
-      # ============================================================
-
-      - name: Enable auto-merge (or merge immediately if no checks)
-        if: steps.diff.outputs.ahead != '0'
-        env:
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
+      - name: Create and push tag
         run: |
-          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.tag }}" \
+            -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
 
-          # Try auto-merge first; this waits for required status checks if any.
-          if gh pr merge "${PR_NUMBER}" --auto --merge; then
-            echo "Auto-merge enabled for PR #${PR_NUMBER}"
-          else
-            # Auto-merge requires the feature enabled and at least one required
-            # check on main. If unavailable, merge straight away.
-            echo "Auto-merge unavailable; attempting immediate merge"
-            gh pr merge "${PR_NUMBER}" --merge --admin || \
-              gh pr merge "${PR_NUMBER}" --merge
-          fi
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:  ${{ steps.version.outputs.tag }}
+          name:      ${{ steps.version.outputs.tag }}
+          body_path: release_notes.md
