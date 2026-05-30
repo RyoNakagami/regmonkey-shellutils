@@ -1,0 +1,10 @@
+[skill]
+name        = "regmonkey-shellscript"
+version     = "0.1.0"
+author      = "Ryo Nakagami"
+description = "regmonkey_script リポジトリに新しい shellscript を追加する skill。docstring フォーマット遵守、lib/docstring.sh の usage_helper を利用、bats による unit test を必ず添える。Plan → Code の順序で進め、Code に入る前にユーザー承諾を取る。"
+entry       = "SKILL.md"
+include = [
+    "SKILL.md",
+]
+tags = ["shellscript", "bash", "scaffold", "bats", "regmonkey"]
