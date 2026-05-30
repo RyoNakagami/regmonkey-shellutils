@@ -1,0 +1,261 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-05-30
+# Script: punkt
+# Description:
+#   Convert Japanese punctuation in text files: the touten '、' to a fullwidth
+#   comma '，' and the kuten '。' to a fullwidth period '．'. A custom mapping
+#   of arbitrary strings can be supplied via --map.
+#
+#   Replacement is literal (no regex), so mapping keys/values may contain any
+#   characters including regex metacharacters. By default the change is written
+#   back in place; --dry-run only reports which files would change.
+#
+#   Steps:
+#     1. Parse options (-r/--recursive, --map, --dry-run, -h) and an optional
+#        positional target (file or directory; defaults to './').
+#     2. Build the replacement pairs from --map, or use the default
+#        '、'->'，' and '。'->'．' when --map is omitted.
+#     3. Resolve targets: a single file, or the text files directly under a
+#        directory (recursively with -r). Hidden and binary files are skipped.
+#     4. Apply literal replacements to each file. With --dry-run nothing is
+#        written; otherwise the file is rewritten in place.
+#     5. Report every file that changed (or would change).
+#
+# Options:
+#   -r, --recursive      Recurse into subdirectories when the target is a dir.
+#   --map "{k:v, ...}"   Custom replacement map. Keys/values are literal
+#                        strings; the first ':' separates a key from its value
+#                        and ',' separates pairs. Example: --map "{foo:bar, 、:，}"
+#   --dry-run            Do not write; only report files that would change.
+#   -h, --help           Show this help message.
+#
+# Usage:
+#   punkt                          # convert text files directly under ./
+#   punkt ./ -r                    # convert recursively
+#   punkt ./notes.md               # convert a single file
+#   punkt ./notes.md --map "{foo:bar, 、:，}"
+#   punkt ./ -r --dry-run          # preview only
+#
+# Notes:
+#   - Requires awk on PATH (literal replacement is done in awk, no regex).
+#   - Hidden files ('.'-prefixed) are excluded by default.
+#   - Binary files are skipped (detected with 'grep -Iq').
+#   - Sources '../../lib/docstring.sh' for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+RECURSIVE=false
+DRY_RUN=false
+MAP_SPEC=""
+TARGET=""
+
+# Parallel arrays of literal find/replace pairs.
+KEYS=()
+VALS=()
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage_helper
+      exit 0
+      ;;
+    -r|--recursive)
+      RECURSIVE=true
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --map)
+      [[ $# -ge 2 ]] || { echo "Error: --map requires an argument." >&2; exit 1; }
+      MAP_SPEC="$2"
+      shift 2
+      ;;
+    --map=*)
+      MAP_SPEC="${1#*=}"
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Error: unknown option: $1" >&2
+      usage_helper >&2
+      exit 1
+      ;;
+    *)
+      if [[ -n "${TARGET}" ]]; then
+        echo "Error: only one <path> argument is allowed (got '${TARGET}' and '$1')." >&2
+        exit 1
+      fi
+      TARGET="$1"
+      shift
+      ;;
+  esac
+done
+
+# Allow remaining positional after '--'
+while [[ $# -gt 0 ]]; do
+  if [[ -n "${TARGET}" ]]; then
+    echo "Error: only one <path> argument is allowed (got '${TARGET}' and '$1')." >&2
+    exit 1
+  fi
+  TARGET="$1"
+  shift
+done
+
+# ---- Validate dependencies ----
+command -v awk >/dev/null 2>&1 || {
+  echo "Error: 'awk' command not found in PATH." >&2
+  exit 1
+}
+
+# ---- Build replacement pairs ----
+if [[ -z "${MAP_SPEC}" ]]; then
+  KEYS=("、" "。")
+  VALS=("，" "．")
+else
+  # Must be wrapped in { ... }.
+  trimmed="${MAP_SPEC#"${MAP_SPEC%%[![:space:]]*}"}"   # ltrim
+  trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"      # rtrim
+  if [[ "${trimmed}" != \{*\} ]]; then
+    echo "Error: --map must be wrapped in braces, e.g. \"{、:，, 。:．}\" (got: '${MAP_SPEC}')." >&2
+    exit 1
+  fi
+  inner="${trimmed#\{}"
+  inner="${inner%\}}"
+
+  IFS=',' read -r -a _pairs <<< "${inner}"
+  for pair in "${_pairs[@]}"; do
+    # ltrim/rtrim whitespace around the pair
+    pair="${pair#"${pair%%[![:space:]]*}"}"
+    pair="${pair%"${pair##*[![:space:]]}"}"
+    [[ -z "${pair}" ]] && continue
+    if [[ "${pair}" != *:* ]]; then
+      echo "Error: invalid map entry (missing ':'): '${pair}'." >&2
+      exit 1
+    fi
+    key="${pair%%:*}"
+    val="${pair#*:}"
+    if [[ -z "${key}" ]]; then
+      echo "Error: empty key in map entry: '${pair}'." >&2
+      exit 1
+    fi
+    KEYS+=("${key}")
+    VALS+=("${val}")
+  done
+
+  if [[ ${#KEYS[@]} -eq 0 ]]; then
+    echo "Error: --map contained no replacement pairs." >&2
+    exit 1
+  fi
+fi
+
+# ---- Resolve target ----
+if [[ -z "${TARGET}" ]]; then
+  TARGET="./"
+fi
+
+FILES=()
+if [[ -f "${TARGET}" ]]; then
+  [[ -r "${TARGET}" ]] || { echo "Error: cannot read file: '${TARGET}'." >&2; exit 1; }
+  FILES=("${TARGET}")
+elif [[ -d "${TARGET}" ]]; then
+  if ${RECURSIVE}; then
+    while IFS= read -r -d '' f; do
+      FILES+=("${f}")
+    done < <(find "${TARGET}" -type f -not -path '*/.*' -print0)
+  else
+    while IFS= read -r -d '' f; do
+      FILES+=("${f}")
+    done < <(find "${TARGET}" -maxdepth 1 -type f -not -name '.*' -print0)
+  fi
+else
+  echo "Error: target does not exist: '${TARGET}'." >&2
+  exit 1
+fi
+
+# ---- Run ----
+# replace_literal: read stdin, apply every KEYS[i]->VALS[i] as a literal
+# (non-regex) substitution, write to stdout. Pairs are passed in as
+# k0,v0,k1,v1,... ARGV entries so arbitrary bytes survive untouched.
+replace_literal() {
+  # LC_ALL=C makes awk operate on raw bytes, so multibyte keys/values are
+  # matched byte-for-byte and invalid byte sequences pass through untouched.
+  # RS='\0' slurps the whole file as one record, preserving the exact trailing
+  # newline (or its absence); printf with no ORS writes it back verbatim.
+  LC_ALL=C awk '
+    function lit_gsub(s, from, to,   out, idx, flen) {
+      flen = length(from)
+      if (flen == 0) return s
+      out = ""
+      while ((idx = index(s, from)) > 0) {
+        out = out substr(s, 1, idx - 1) to
+        s = substr(s, idx + flen)
+      }
+      return out s
+    }
+    BEGIN {
+      RS = "\0"
+      n = 0
+      for (i = 1; i < ARGC; i += 2) {
+        n++
+        FROM[n] = ARGV[i]
+        TO[n]   = ARGV[i + 1]
+      }
+      ARGC = 1
+    }
+    {
+      data = $0
+      for (i = 1; i <= n; i++) data = lit_gsub(data, FROM[i], TO[i])
+      printf "%s", data
+    }
+  ' "$@"
+}
+
+# Build the awk ARGV pair list once.
+PAIR_ARGS=()
+for i in "${!KEYS[@]}"; do
+  PAIR_ARGS+=("${KEYS[${i}]}" "${VALS[${i}]}")
+done
+
+changed=0
+tmp_out="$(mktemp)"
+trap 'rm -f "${tmp_out}"' EXIT
+
+for file in "${FILES[@]}"; do
+  [[ -r "${file}" ]] || continue
+  # Skip binary files (non-empty files with no printable content).
+  if [[ -s "${file}" ]] && ! grep -Iq . "${file}" 2>/dev/null; then
+    continue
+  fi
+
+  replace_literal "${PAIR_ARGS[@]}" < "${file}" > "${tmp_out}"
+
+  if cmp -s "${tmp_out}" "${file}"; then
+    continue
+  fi
+
+  changed=$((changed + 1))
+  if ${DRY_RUN}; then
+    echo "would change: ${file}"
+  else
+    cat "${tmp_out}" > "${file}"
+    echo "changed: ${file}"
+  fi
+done
+
+if [[ ${changed} -eq 0 ]]; then
+  echo "No files changed."
+fi
