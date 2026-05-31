@@ -1,0 +1,101 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-05-31
+# Script: ping-check
+# Description:
+#   A simple script to test basic network connectivity using ping. By
+#   default, it checks IPv4 connectivity by pinging Google's DNS (8.8.8.8).
+#   Optionally, it can check IPv6 connectivity by pinging Google's IPv6 DNS
+#   (2001:4860:4860::8888). A custom hostname or IP address may also be
+#   given.
+#
+#   Steps:
+#     1. Parse options (-4/--v4, -6/--v6, -c/--count, -h).
+#     2. Default the target based on IP version when none is provided.
+#     3. Run 'ping' with the chosen IP version, packet count, and target.
+#
+# Options:
+#   -4, --v4           Use IPv4 (default).
+#   -6, --v6           Use IPv6.
+#   -c, --count COUNT  Number of ping packets to send (default: 3).
+#   -h, --help         Show this help message.
+#
+# Usage:
+#   ping-check                # Test IPv4 (default)
+#   ping-check -6             # Test IPv6
+#   ping-check google.com     # Test IPv4 to google.com
+#   ping-check -6 google.com  # Test IPv6 to google.com
+#   ping-check -c 5           # Test IPv4 with 5 packets
+#   ping-check -c 5 yahoo.com # Test IPv4 yahoo.com with 5 packets
+#
+# Exit Codes:
+#   0   Connection succeeded (ping received a reply).
+#   1   Invalid usage or connection failed.
+#
+# Notes:
+#   - Requires 'ping' to support '-4' and '-6' options.
+#   - Useful for quick connectivity checks or troubleshooting network settings.
+#   - Sources lib/docstring.sh for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+IP_VERSION="-4"
+TARGET=""
+PINGCOUNT="3"
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  -4 | --v4)
+    IP_VERSION="-4"
+    shift
+    ;;
+  -6 | --v6)
+    IP_VERSION="-6"
+    shift
+    ;;
+  -c | --count)
+    if [[ -n "${2:-}" && "$2" =~ ^[0-9]+$ ]]; then
+      PINGCOUNT="$2"
+      shift 2
+    else
+      echo "Error: --count requires a numeric argument." >&2
+      usage_helper
+      exit 1
+    fi
+    ;;
+  -h | --help)
+    usage_helper
+    exit 0
+    ;;
+  -*)
+    echo "Error: unknown option: $1" >&2
+    usage_helper
+    exit 1
+    ;;
+  *)
+    # If it's not an option, assume it's the target hostname/IP.
+    TARGET="$1"
+    shift
+    ;;
+  esac
+done
+
+# ---- Default target depends on IP version ----
+if [[ -z "${TARGET}" ]]; then
+  if [[ "${IP_VERSION}" == "-4" ]]; then
+    TARGET="8.8.8.8"
+  else
+    TARGET="2001:4860:4860::8888"
+  fi
+fi
+
+# ---- Execute ping ----
+ping "${IP_VERSION}" -c "${PINGCOUNT}" "${TARGET}"
