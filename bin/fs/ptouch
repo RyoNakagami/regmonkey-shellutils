@@ -1,0 +1,128 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-05-23
+# Script: ptouch
+# Description:
+#   Create an empty file at <path>, creating any missing parent directories,
+#   and set its permission mode. Equivalent to:
+#
+#       install -Dm<MODE> /dev/null <path>
+#
+#   Default mode is 755. Existing files are not overwritten unless --force is
+#   given.
+#
+#   Steps:
+#     1. Parse options (-m/--permission MODE, -f/--force, -h).
+#     2. Validate that 'install' exists and arguments are well-formed.
+#     3. Reject if <path> already exists (unless --force) or is a directory.
+#     4. Run 'install -Dm<MODE> /dev/null <path>'.
+#
+# Options:
+#   -m, --permission MODE   Octal permission mode (3-4 digits). Default: 755.
+#   -f, --force             Overwrite <path> if it already exists.
+#   -h, --help              Show this help message.
+#
+# Usage:
+#   ptouch <path>
+#   ptouch ./a/b/c/file.sh
+#   ptouch -m 644 ./conf/app.conf
+#   ptouch --permission 600 ~/.ssh/foo
+#   ptouch -f ./existing-file
+#
+# Notes:
+#   - Requires the 'install' command (coreutils) on PATH.
+#   - 'install -D' creates parent directories as needed.
+#   - Sources lib/docstring.sh for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+MODE="755"
+FORCE=false
+TARGET=""
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage_helper
+            exit 0
+            ;;
+        -m|--permission)
+            [[ $# -ge 2 ]] || { echo "Error: --permission requires an argument." >&2; exit 1; }
+            MODE="$2"
+            shift 2
+            ;;
+        --permission=*)
+            MODE="${1#*=}"
+            shift
+            ;;
+        -f|--force)
+            FORCE=true
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            usage_helper >&2
+            exit 1
+            ;;
+        *)
+            if [[ -n "${TARGET}" ]]; then
+                echo "Error: only one <path> argument is allowed (got '${TARGET}' and '$1')." >&2
+                exit 1
+            fi
+            TARGET="$1"
+            shift
+            ;;
+    esac
+done
+
+# Allow remaining positional after '--'
+while [[ $# -gt 0 ]]; do
+    if [[ -n "${TARGET}" ]]; then
+        echo "Error: only one <path> argument is allowed (got '${TARGET}' and '$1')." >&2
+        exit 1
+    fi
+    TARGET="$1"
+    shift
+done
+
+# ---- Validate ----
+command -v install >/dev/null 2>&1 || {
+    echo "Error: 'install' command not found in PATH." >&2
+    exit 1
+}
+
+if [[ -z "${TARGET}" ]]; then
+    echo "Error: <path> argument is required." >&2
+    usage_helper >&2
+    exit 1
+fi
+
+if [[ ! "${MODE}" =~ ^[0-7]{3,4}$ ]]; then
+    echo "Error: invalid permission mode: '${MODE}' (expected 3-4 octal digits)." >&2
+    exit 1
+fi
+
+if [[ -d "${TARGET}" ]]; then
+    echo "Error: <path> is an existing directory: '${TARGET}'." >&2
+    exit 1
+fi
+
+if [[ -e "${TARGET}" ]] && ! ${FORCE}; then
+    echo "Error: <path> already exists: '${TARGET}' (use -f/--force to overwrite)." >&2
+    exit 1
+fi
+
+# ---- Run ----
+install -D -m "${MODE}" /dev/null "${TARGET}"
