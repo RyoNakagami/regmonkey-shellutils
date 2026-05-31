@@ -1,0 +1,90 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-05-31
+# Script: check-github-connection
+# Description:
+#   Check connectivity to GitHub. By default, fetches the GitHub status from
+#   the GitHub Status API and prints the overall '.status' object. With
+#   --time, measures the connection timing breakdown (DNS, TCP, TLS, TTFB,
+#   total) and HTTP code for a request to https://github.com.
+#
+#   Steps:
+#     1. Parse options (--time, -h).
+#     2. Validate that required commands exist ('curl' always; 'jq' for
+#        the default status mode).
+#     3. Default mode: GET githubstatus.com status API, print '.status'.
+#        --time mode: GET github.com with curl '-w' timing template.
+#
+# Options:
+#   --time      Print connection timing breakdown for https://github.com.
+#   -h, --help  Show this help message.
+#
+# Usage:
+#   check-github-connection
+#   check-github-connection --time
+#
+# Notes:
+#   - Requires an internet connection.
+#   - Requires 'curl'; the default status mode additionally requires 'jq'.
+#   - Sources lib/docstring.sh for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+MODE="status"
+STATUS_URL="https://www.githubstatus.com/api/v2/status.json"
+TARGET_URL="https://github.com"
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage_helper
+            exit 0
+            ;;
+        --time)
+            MODE="time"
+            shift
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            usage_helper >&2
+            exit 1
+            ;;
+        *)
+            echo "Error: no positional arguments are accepted (got '$1')." >&2
+            usage_helper >&2
+            exit 1
+            ;;
+    esac
+done
+
+# ---- Validate ----
+command -v curl >/dev/null 2>&1 || {
+    echo "Error: 'curl' command not found in PATH." >&2
+    exit 1
+}
+
+# ---- Run ----
+if [[ "${MODE}" == "time" ]]; then
+    curl -o /dev/null -s -w "\
+  dns:        %{time_namelookup}s
+  tcp:        %{time_connect}s
+  tls:        %{time_appconnect}s
+  ttfb:       %{time_starttransfer}s
+  total:      %{time_total}s
+  http_code:  %{http_code}
+" "${TARGET_URL}"
+else
+    command -v jq >/dev/null 2>&1 || {
+        echo "Error: 'jq' command not found in PATH (required for status mode)." >&2
+        exit 1
+    }
+    curl -s "${STATUS_URL}" | jq .status
+fi
