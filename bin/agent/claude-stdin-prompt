@@ -1,0 +1,269 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-05-22
+# Script: claude-stdin-prompt
+# Description:
+#   Sends piped/redirected stdin together with a prompt to the 'claude' CLI
+#   in non-interactive print mode and writes the response to stdout.
+#
+#   Designed to be used in a shell pipeline:
+#
+#     git diff --cached | claude-stdin-prompt \
+#       --model sonnet \
+#       -p "commit message を作成してください"
+#
+#     claude-stdin-prompt -p "要約して" < memo.md
+#
+#   The prompt body is supplied via -p/--prompt (literal text) or
+#   --prompt-file (path to a file whose contents become the prompt). One of
+#   these is required; a bare positional argument is also accepted as a
+#   literal prompt when neither flag is given.
+#
+#   Steps:
+#     1. Parse wrapper options (--prompt, --prompt-file, --context,
+#        --context-file, --help).
+#     2. Resolve the prompt and any context blocks.
+#     3. Read stdin (must be piped or redirected; refuses interactive TTY).
+#     4. Compose "# Context / # Instruction / # stdin" and call claude
+#        non-interactively in --print mode.
+#     5. Forward unknown options to claude verbatim. Use '--' to end wrapper
+#        parsing explicitly.
+#
+# Wrapper-owned options (consumed by this script):
+#   -p, --prompt <text>           Prompt text (literal string). May also be
+#                                 passed as a bare positional argument.
+#   --prompt-file <path>          Path to a file whose contents are used as
+#                                 the prompt. Mutually exclusive with -p.
+#   --context <text>              Literal context placed BEFORE the prompt.
+#                                 Repeatable; blocks are joined in order.
+#   --context-file <path>         File whose contents are used as a context
+#                                 block. Repeatable; may be mixed with
+#                                 --context. The path must exist.
+#   -h, --help                    Show this help message.
+#   --                            End wrapper parsing; remaining args go to
+#                                 claude verbatim.
+#
+# Forwarded options (anything else):
+#   ALL other flags and values are forwarded to 'claude' verbatim. This means
+#   any option supported by claude --help can be used here directly, e.g.
+#   --model, --output-format, --append-system-prompt, --add-dir, --debug,
+#   --max-budget-usd, --json-schema, etc.
+#
+#   See 'claude --help' for the full list.
+#
+# Usage:
+#   <command> | claude-stdin-prompt [claude options...] -p PROMPT
+#   <command> | claude-stdin-prompt [claude options...] --prompt-file PATH
+#
+#   git diff --cached | claude-stdin-prompt --model sonnet -p "commit message を作成して"
+#   git log -n 20    | claude-stdin-prompt --output-format json -p "リリースノート作成"
+#   claude-stdin-prompt --model opus --prompt-file prompts/review.md < diff.patch
+#   cat data.csv     | claude-stdin-prompt --model sonnet "外れ値を指摘して"
+#
+#   # Apply project-specific commit conventions:
+#   git diff --cached | claude-stdin-prompt \
+#       --context-file docs/commit-rules.md \
+#       --context "出力は日本語で" \
+#       -p "コミットメッセージを生成"
+#
+# Notes:
+#   - Requires the 'claude' CLI on PATH.
+#   - stdin is mandatory; running with a TTY on stdin exits with an error.
+#   - --print is always injected; claude is invoked non-interactively.
+#   - Boolean claude flags placed immediately before a bare positional prompt
+#     can confuse argument parsing (the positional is mistaken for the flag's
+#     value). Disambiguate by using -p/--prompt explicitly, e.g.
+#     'claude-stdin-prompt --debug -p "PROMPT"'.
+#   - Sources lib/docstring.sh for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+PROMPT=""
+PROMPT_SET=false
+PROMPT_SOURCE=""           # "flag" | "file" | "positional"
+CONTEXT_PARTS=()           # each entry: "lit:<text>" or "file:<path>"
+PASSTHRU=()
+PREV_WAS_FLAG=false
+
+set_prompt_once() {
+    local source="$1"
+    local value="$2"
+    if ${PROMPT_SET}; then
+        echo "Error: prompt specified more than once (previous via ${PROMPT_SOURCE}, new via ${source})." >&2
+        exit 1
+    fi
+    PROMPT="${value}"
+    PROMPT_SET=true
+    PROMPT_SOURCE="${source}"
+}
+
+# ---- Parse command-line options ----
+# Strategy: consume wrapper-owned options; forward everything else to claude
+# verbatim. For an unknown flag (-*) we forward it and treat the next non-flag
+# token as its value (heuristic so '--model sonnet' stays paired).
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage_helper
+            exit 0
+            ;;
+        -p|--prompt)
+            [[ $# -ge 2 ]] || { echo "Error: --prompt requires an argument." >&2; exit 1; }
+            set_prompt_once "flag" "$2"
+            shift 2
+            PREV_WAS_FLAG=false
+            ;;
+        --prompt=*)
+            set_prompt_once "flag" "${1#*=}"
+            shift
+            PREV_WAS_FLAG=false
+            ;;
+        --prompt-file)
+            [[ $# -ge 2 ]] || { echo "Error: --prompt-file requires an argument." >&2; exit 1; }
+            [[ -f "$2" ]] || { echo "Error: --prompt-file: file not found: $2" >&2; exit 1; }
+            set_prompt_once "file" "$(cat -- "$2")"
+            shift 2
+            PREV_WAS_FLAG=false
+            ;;
+        --prompt-file=*)
+            _pf="${1#*=}"
+            [[ -f "${_pf}" ]] || { echo "Error: --prompt-file: file not found: ${_pf}" >&2; exit 1; }
+            set_prompt_once "file" "$(cat -- "${_pf}")"
+            unset _pf
+            shift
+            PREV_WAS_FLAG=false
+            ;;
+        --context)
+            [[ $# -ge 2 ]] || { echo "Error: --context requires an argument." >&2; exit 1; }
+            CONTEXT_PARTS+=("lit:$2")
+            shift 2
+            PREV_WAS_FLAG=false
+            ;;
+        --context=*)
+            CONTEXT_PARTS+=("lit:${1#*=}")
+            shift
+            PREV_WAS_FLAG=false
+            ;;
+        --context-file)
+            [[ $# -ge 2 ]] || { echo "Error: --context-file requires an argument." >&2; exit 1; }
+            [[ -f "$2" ]] || { echo "Error: --context-file: file not found: $2" >&2; exit 1; }
+            CONTEXT_PARTS+=("file:$2")
+            shift 2
+            PREV_WAS_FLAG=false
+            ;;
+        --context-file=*)
+            _cf="${1#*=}"
+            [[ -f "${_cf}" ]] || { echo "Error: --context-file: file not found: ${_cf}" >&2; exit 1; }
+            CONTEXT_PARTS+=("file:${_cf}")
+            unset _cf
+            shift
+            PREV_WAS_FLAG=false
+            ;;
+        --)
+            shift
+            PASSTHRU+=("$@")
+            break
+            ;;
+        -*)
+            PASSTHRU+=("$1")
+            PREV_WAS_FLAG=true
+            shift
+            ;;
+        *)
+            if ${PREV_WAS_FLAG}; then
+                PASSTHRU+=("$1")
+                PREV_WAS_FLAG=false
+            elif ! ${PROMPT_SET}; then
+                set_prompt_once "positional" "$1"
+            else
+                PASSTHRU+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+# ---- Validate prerequisites ----
+command -v claude >/dev/null 2>&1 || {
+    echo "Error: 'claude' CLI not found in PATH." >&2
+    exit 1
+}
+
+if [ -t 0 ]; then
+    echo "Error: stdin is a TTY. Pipe or redirect input, e.g. 'cmd | $(basename "$0") -p \"...\"'." >&2
+    exit 1
+fi
+
+if ! ${PROMPT_SET} || [[ -z "${PROMPT}" ]]; then
+    echo "Error: no prompt given. Use -p/--prompt, --prompt-file, or pass it as the positional ARG." >&2
+    exit 1
+fi
+
+# ---- Resolve context blocks ----
+CONTEXT=""
+if (( ${#CONTEXT_PARTS[@]} > 0 )); then
+    for entry in "${CONTEXT_PARTS[@]}"; do
+        kind="${entry%%:*}"
+        value="${entry#*:}"
+        case "${kind}" in
+            lit)  block="${value}" ;;
+            file) block="$(cat -- "${value}")" ;;
+            *)    echo "Error: internal: unknown context kind: ${kind}" >&2; exit 1 ;;
+        esac
+        if [[ -z "${CONTEXT}" ]]; then
+            CONTEXT="${block}"
+        else
+            CONTEXT="${CONTEXT}
+
+---
+
+${block}"
+        fi
+    done
+fi
+
+# ---- Read stdin ----
+STDIN_CONTENT="$(cat)"
+
+# ---- Combine context (optional) + prompt + stdin ----
+COMBINED=""
+if [[ -n "${CONTEXT}" ]]; then
+    COMBINED+="# Context
+${CONTEXT}
+
+---
+
+"
+fi
+COMBINED+="# Instruction
+${PROMPT}
+
+---
+
+# stdin
+${STDIN_CONTENT}"
+
+# ---- Default model handling ----
+MODEL_SPECIFIED=false
+for arg in "${PASSTHRU[@]}"; do
+    if [[ "${arg}" == "--model" || "${arg}" == --model=* ]]; then
+        MODEL_SPECIFIED=true
+        break
+    fi
+done
+
+if ! ${MODEL_SPECIFIED}; then
+    PASSTHRU=(--model sonnet "${PASSTHRU[@]}")
+fi
+
+# ---- Invoke claude ----
+# 'claude --print <prompt>' takes the prompt as a positional argument; '--'
+# guarantees the combined string is never re-parsed as flags.
+exec claude --print "${PASSTHRU[@]}" -- "${COMBINED}"

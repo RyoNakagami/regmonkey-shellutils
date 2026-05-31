@@ -1,0 +1,246 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-05-19
+# Script: codex-stdin-prompt
+# Description:
+#   Sends piped/redirected stdin together with a prompt to the 'codex' CLI
+#   in non-interactive quiet mode and writes the response to stdout.
+#
+#   Designed to be used in a shell pipeline:
+#
+#     git diff --cached | codex-stdin-prompt \
+#       --model o4-mini \
+#       -p "commit message を作成してください"
+#
+#     codex-stdin-prompt -p "要約して" < memo.md
+#
+#   The positional ARG (or -p/--prompt value) is the instruction. When the
+#   value is a path to an existing file, that file's contents are used as
+#   the prompt body instead of the literal string. stdin supplies the data
+#   the prompt operates on.
+#
+#   Steps:
+#     1. Parse wrapper options (-p/--prompt, --context-file, etc).
+#     2. Resolve the prompt and any context (literal string or file contents).
+#     3. Read stdin (must be piped or redirected; refuses interactive TTY).
+#     4. Join context, prompt, and stdin and call: codex --quiet ... <combined>.
+#     5. Forward unknown options after '--' verbatim to codex.
+#
+# Wrapper-owned options (consumed by this script):
+#   -p, --prompt <text|file>      Prompt text, or path to a file containing the
+#                                 prompt. May also be passed as a positional arg.
+#   --context-file <text|file>    Additional context placed BEFORE the prompt
+#                                 (e.g. commit-message rules, style guide). The
+#                                 value is read as a file when it points to one,
+#                                 otherwise treated as a literal string. Repeat
+#                                 the flag to stack multiple context blocks
+#                                 (joined in given order with a separator).
+#   --custom-verbose              Stream codex's full progress output (header,
+#                                 token counts, tool invocations, final reply)
+#                                 directly to the terminal via 'exec codex ...'.
+#                                 Without this flag, only the final agent
+#                                 message is printed (progress is suppressed).
+#   -h, --help                    Show this help message.
+#   --                            End wrapper parsing; remaining args go to
+#                                 codex verbatim.
+#
+# Forwarded options (anything else):
+#   ALL other flags and values are forwarded to 'codex' verbatim. This means
+#   any option supported by codex --help can be used here directly, e.g.
+#   --model, --provider, --approval-mode, etc.
+#
+#   See 'codex --help' for the full list.
+#
+# Usage:
+#   <command> | codex-stdin-prompt [codex options...] [-p PROMPT|PROMPT|FILE]
+#
+#   git diff --cached | codex-stdin-prompt --model o4-mini -p "commit message を作成して"
+#   git log -n 20    | codex-stdin-prompt --model gpt-4o  -p "リリースノート作成"
+#   codex-stdin-prompt --model o4-mini -p prompts/review.md < diff.patch
+#   cat data.csv     | codex-stdin-prompt --model o4-mini "外れ値を指摘して"
+#
+#   # Apply project-specific commit conventions:
+#   git diff --cached | codex-stdin-prompt \
+#       --context-file docs/commit-rules.md \
+#       --context-file "出力は日本語で" \
+#       -p "コミットメッセージを生成"
+#
+# Notes:
+#   - Requires the 'codex' CLI on PATH.  Install: npm install -g @openai/codex
+#   - stdin is mandatory; running with a TTY on stdin exits with an error.
+#   - -q/--quiet is always injected; codex is invoked non-interactively.
+#   - --approval-mode full-auto is injected to suppress tool-approval prompts.
+#   - Boolean codex flags placed immediately before a bare positional prompt
+#     can confuse argument parsing (the positional is mistaken for the flag's
+#     value). Disambiguate by using -p/--prompt explicitly, e.g.
+#     'codex-stdin-prompt --model o4-mini -p "PROMPT"'.
+#   - Sources lib/docstring.sh for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+PROMPT=""
+PROMPT_SET=false
+CONTEXT_PARTS=()
+PASSTHRU=()
+PREV_WAS_FLAG=false
+CUSTOM_VERBOSE=false
+
+# ---- Parse command-line options ----
+# Strategy: consume only -h/--help and -p/--prompt; forward everything else
+# to codex verbatim. For an unknown flag (-*) we forward it and treat the
+# next non-flag token as its value (heuristic so '--model o4-mini' stays paired).
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage_helper
+            exit 0
+            ;;
+        -p|--prompt)
+            [[ $# -ge 2 ]] || { echo "Error: --prompt requires an argument." >&2; exit 1; }
+            PROMPT="$2"
+            PROMPT_SET=true
+            shift 2
+            PREV_WAS_FLAG=false
+            ;;
+        --prompt=*)
+            PROMPT="${1#*=}"
+            PROMPT_SET=true
+            shift
+            PREV_WAS_FLAG=false
+            ;;
+        --context-file)
+            [[ $# -ge 2 ]] || { echo "Error: --context-file requires an argument." >&2; exit 1; }
+            CONTEXT_PARTS+=("$2")
+            shift 2
+            PREV_WAS_FLAG=false
+            ;;
+        --context-file=*)
+            CONTEXT_PARTS+=("${1#*=}")
+            shift
+            PREV_WAS_FLAG=false
+            ;;
+        --custom-verbose)
+            CUSTOM_VERBOSE=true
+            shift
+            PREV_WAS_FLAG=false
+            ;;
+        --)
+            shift
+            PASSTHRU+=("$@")
+            break
+            ;;
+        -*)
+            PASSTHRU+=("$1")
+            PREV_WAS_FLAG=true
+            shift
+            ;;
+        *)
+            if $PREV_WAS_FLAG; then
+                # Treat as the previous flag's value.
+                PASSTHRU+=("$1")
+                PREV_WAS_FLAG=false
+            elif ! $PROMPT_SET; then
+                PROMPT="$1"
+                PROMPT_SET=true
+            else
+                PASSTHRU+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+# ---- Validate prerequisites ----
+command -v codex >/dev/null 2>&1 || {
+    echo "Error: 'codex' CLI not found in PATH." >&2
+    echo "Install with: npm install -g @openai/codex" >&2
+    exit 1
+}
+
+if [ -t 0 ]; then
+    echo "Error: stdin is a TTY. Pipe or redirect input, e.g. 'cmd | $(basename "$0") -p \"...\"'." >&2
+    exit 1
+fi
+
+if [[ -z "$PROMPT" ]]; then
+    echo "Error: no prompt given. Use -p/--prompt or pass it as the positional ARG." >&2
+    exit 1
+fi
+
+# ---- Resolve prompt: file path -> contents, otherwise literal ----
+if [[ -f "$PROMPT" ]]; then
+    PROMPT="$(cat -- "$PROMPT")"
+fi
+
+# ---- Resolve context blocks: each value is a file path or literal string ----
+CONTEXT=""
+if (( ${#CONTEXT_PARTS[@]} > 0 )); then
+    for c in "${CONTEXT_PARTS[@]}"; do
+        if [[ -f "$c" ]]; then
+            c="$(cat -- "$c")"
+        fi
+        if [[ -z "$CONTEXT" ]]; then
+            CONTEXT="$c"
+        else
+            CONTEXT="${CONTEXT}
+
+---
+
+${c}"
+        fi
+    done
+fi
+
+# ---- Read stdin ----
+STDIN_CONTENT="$(cat)"
+
+# ---- Combine context (optional) + prompt + stdin ----
+if [[ -n "$CONTEXT" ]]; then
+    COMBINED="# Context
+${CONTEXT}
+
+---
+
+# Instruction
+${PROMPT}
+
+---
+# stdin
+${STDIN_CONTENT}"
+else
+    COMBINED="${PROMPT}
+
+---
+# stdin
+${STDIN_CONTENT}"
+fi
+
+# ---- Build codex args ----
+# exec                                       : non-interactive subcommand
+# --dangerously-bypass-approvals-and-sandbox : suppress approval prompts
+#   (safe here because we are only doing text generation, not file writes)
+CODEX_ARGS=(exec --dangerously-bypass-approvals-and-sandbox)
+
+(( ${#PASSTHRU[@]} > 0 )) && CODEX_ARGS+=("${PASSTHRU[@]}")
+
+# ---- Invoke codex ----
+# Default: capture only the final agent message via -o <tmpfile> and discard
+#          codex's verbose progress output (header, token counts, etc.).
+# --custom-verbose: exec codex directly so its full progress stream is shown
+#                   on the terminal as it runs.
+if $CUSTOM_VERBOSE; then
+    exec codex "${CODEX_ARGS[@]}" "$COMBINED"
+fi
+
+TMPFILE="$(mktemp)"
+trap 'rm -f "$TMPFILE"' EXIT
+
+codex "${CODEX_ARGS[@]}" -o "$TMPFILE" "$COMBINED" >/dev/null 2>&1
+printf "\n" >> "$TMPFILE"  # ensure final newline
+cat "$TMPFILE"
