@@ -1,0 +1,273 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-02
+# Script: sysfetch
+# Description:
+#   Display system information including hostname, OS, kernel, uptime,
+#   CPU/GPU usage, memory, and disk usage in a clean formatted output.
+#
+#   Steps:
+#     1. Parse command-line options (-j/--json, -h/--help).
+#     2. Collect system info, calling each backend command once.
+#     3. Collect disk usage, excluding virtual filesystems.
+#     4. Print results in table or JSON format.
+#
+# Options:
+#   -j, --json    Output in JSON format
+#   -h, --help    Show this help message and exit
+#
+# Output Fields:
+#   hostname      - System hostname
+#   os            - Operating system name and version
+#   architecture  - CPU architecture (x86_64, arm64, etc.)
+#   kernel        - Linux kernel version
+#   build_date    - Kernel build date (UTC)
+#   uptime        - System uptime
+#   cpu_usage     - Current CPU utilization percentage
+#   gpu           - GPU name and utilization (if NVIDIA GPU available)
+#   memory        - Used/Total memory with percentage
+#   disks         - Used/Total disk space for all mounted filesystems
+#
+# Usage:
+#   sysfetch          # Display system information
+#   sysfetch -j       # Display in JSON format
+#   sysfetch --json   # Display in JSON format
+#   sysfetch --help   # Show this help message
+#
+# Notes:
+#   - GPU information requires nvidia-smi (NVIDIA driver)
+#   - CPU usage is a snapshot from top command
+#   - Disks exclude virtual filesystems (tmpfs, devtmpfs, squashfs, overlay)
+#   - Sources '../../lib/docstring.sh' for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+
+# Extract the kernel build date (UTC) from a 'uname -v' string.
+# Args: $1=uname_v_string ; prints the matched date, or "-" when absent.
+_extract_build_date() {
+    local kver="$1"
+    if [[ "${kver}" =~ ([A-Z][a-z]{2}\ [A-Z][a-z]{2}\ [0-9]{1,2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ UTC) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+        printf '%s\n' "-"
+    fi
+}
+
+# Compute used/total as a percentage with one decimal place.
+# Args: $1=used  $2=total ; prints "0.0" when total is not a positive integer.
+_calc_percent() {
+    local used="$1" total="$2"
+    if [[ "${total}" =~ ^[0-9]+$ ]] && (( total > 0 )); then
+        awk "BEGIN { printf \"%.1f\", (${used} / ${total}) * 100 }"
+    else
+        printf '%s\n' "0.0"
+    fi
+}
+
+# Format GPU info for the table column.
+# Args: $1=gpu_name  $2=gpu_usage ; prints "Not available" when name is empty.
+_gpu_display() {
+    local name="$1" usage="$2"
+    if [[ -n "${name}" ]]; then
+        printf '%s (%s%%)\n' "${name}" "${usage}"
+    else
+        printf '%s\n' "Not available"
+    fi
+}
+
+# Escape a string for safe inclusion inside a JSON double-quoted value.
+# Args: $1=string ; prints the escaped string (no trailing newline).
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "${s}"
+}
+
+# Collect system information, calling each backend command once.
+# Outputs a single pipe-delimited record (see field order below).
+collect_sysinfo() {
+    local hostname os_info architecture
+    IFS='|' read -r hostname os_info architecture < <(
+        hostnamectl | awk -F': ' '
+            /Static hostname/  { h=$2 }
+            /Operating System/ { o=$2 }
+            /Architecture/     { a=$2 }
+            END { print h "|" o "|" a }
+        '
+    )
+
+    local kernel_full build_date
+    kernel_full=$(uname -r)
+    build_date=$(_extract_build_date "$(uname -v)")
+
+    local uptime_info
+    uptime_info=$(uptime -p | sed 's/^up //')
+
+    # CPU usage = user% + system% from a single top snapshot (0 if not found).
+    local cpu_usage
+    cpu_usage=$(top -bn1 | awk '/Cpu\(s\)/ { print $2 + $4; found=1 } END { if (!found) print 0 }')
+
+    # GPU name/usage in a single nvidia-smi query; empty when unavailable.
+    local gpu_name="" gpu_usage=""
+    if command -v nvidia-smi &> /dev/null; then
+        local gpu_raw
+        gpu_raw=$(nvidia-smi --query-gpu=gpu_name,utilization.gpu --format=csv,noheader,nounits 2>/dev/null) || gpu_raw=""
+        if [[ -n "${gpu_raw}" ]]; then
+            IFS='|' read -r gpu_name gpu_usage < <(
+                printf '%s\n' "${gpu_raw}" | awk -F', *' 'NR==1 { print $1 "|" $2 }'
+            )
+        fi
+    fi
+
+    local mem_used mem_total
+    IFS='|' read -r mem_used mem_total < <(free -h | awk '/^Mem:/ { print $3 "|" $2 }')
+    local mem_used_bytes mem_total_bytes
+    IFS='|' read -r mem_used_bytes mem_total_bytes < <(free -b | awk '/^Mem:/ { print $3 "|" $2 }')
+    local mem_percent
+    mem_percent=$(_calc_percent "${mem_used_bytes}" "${mem_total_bytes}")
+
+    # Field order: hostname|os|arch|kernel|build_date|uptime|cpu|gpu_name|gpu_usage|mem_used|mem_total|mem_percent
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "${hostname}" "${os_info}" "${architecture}" "${kernel_full}" "${build_date}" \
+        "${uptime_info}" "${cpu_usage}" "${gpu_name}" "${gpu_usage}" \
+        "${mem_used}" "${mem_total}" "${mem_percent}"
+}
+
+# Collect disk usage (one record per disk), excluding virtual filesystems.
+# Each record is: mountpoint|used|total|percent
+collect_disks() {
+    df -h -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null | \
+        awk 'NR>1 {
+            gsub(/%/, "", $5)
+            print $6"|"$3"|"$2"|"$5
+        }'
+}
+
+# Render system info as an aligned table.
+output_table() {
+    local info
+    info=$(collect_sysinfo)
+    local hostname os_info architecture kernel build_date uptime cpu_usage \
+        gpu_name gpu_usage mem_used mem_total mem_percent
+    IFS='|' read -r hostname os_info architecture kernel build_date uptime cpu_usage \
+        gpu_name gpu_usage mem_used mem_total mem_percent <<< "${info}"
+
+    local gpu_display
+    gpu_display=$(_gpu_display "${gpu_name}" "${gpu_usage}")
+
+    printf "%16s: %s\n" "Static hostname" "${hostname}"
+    printf "%16s: %s\n" "OS" "${os_info}"
+    printf "%16s: %s\n" "Architecture" "${architecture}"
+    printf "%16s: %s\n" "Kernel" "${kernel}"
+    printf "%16s: %s\n" "Build Date" "${build_date}"
+    printf "%16s: %s\n" "Uptime" "${uptime}"
+    printf "%16s: %s%%\n" "CPU Usage" "${cpu_usage}"
+    printf "%16s: %s\n" "GPU" "${gpu_display}"
+    printf "%16s: %s/%s (%s%%)\n" "Memory Usage" "${mem_used}" "${mem_total}" "${mem_percent}"
+
+    local first=true
+    while IFS='|' read -r mountpoint used total percent; do
+        if [[ "${first}" == "true" ]]; then
+            printf "%16s: %s/%s (%s%% used) [%s]\n" "Disk Usage" "${used}" "${total}" "${percent}" "${mountpoint}"
+            first=false
+        else
+            printf "%16s  %s/%s (%s%% used) [%s]\n" "" "${used}" "${total}" "${percent}" "${mountpoint}"
+        fi
+    done < <(collect_disks)
+}
+
+# Render system info as a JSON object.
+output_json() {
+    local info
+    info=$(collect_sysinfo)
+    local hostname os_info architecture kernel build_date uptime cpu_usage \
+        gpu_name gpu_usage mem_used mem_total mem_percent
+    IFS='|' read -r hostname os_info architecture kernel build_date uptime cpu_usage \
+        gpu_name gpu_usage mem_used mem_total mem_percent <<< "${info}"
+
+    local gpu_name_json gpu_usage_json
+    if [[ -n "${gpu_name}" ]]; then
+        gpu_name_json="\"$(_json_escape "${gpu_name}")\""
+        gpu_usage_json="${gpu_usage}"
+    else
+        gpu_name_json="null"
+        gpu_usage_json="null"
+    fi
+
+    local disk_json="" first=true
+    while IFS='|' read -r mountpoint used total percent; do
+        if [[ "${first}" == "true" ]]; then
+            first=false
+        else
+            disk_json+=","
+        fi
+        disk_json+=$'\n'"    {
+      \"mountpoint\": \"$(_json_escape "${mountpoint}")\",
+      \"used\": \"$(_json_escape "${used}")\",
+      \"total\": \"$(_json_escape "${total}")\",
+      \"usage_percent\": ${percent}
+    }"
+    done < <(collect_disks)
+
+    cat <<EOF
+{
+  "hostname": "$(_json_escape "${hostname}")",
+  "os": "$(_json_escape "${os_info}")",
+  "architecture": "$(_json_escape "${architecture}")",
+  "kernel": "$(_json_escape "${kernel}")",
+  "build_date": "$(_json_escape "${build_date}")",
+  "uptime": "$(_json_escape "${uptime}")",
+  "cpu": {
+    "usage_percent": ${cpu_usage}
+  },
+  "gpu": {
+    "name": ${gpu_name_json},
+    "usage_percent": ${gpu_usage_json}
+  },
+  "memory": {
+    "used": "$(_json_escape "${mem_used}")",
+    "total": "$(_json_escape "${mem_total}")",
+    "usage_percent": ${mem_percent}
+  },
+  "disks": [${disk_json}
+  ]
+}
+EOF
+}
+
+main() {
+    local output_format="table"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage_helper "$0"
+                exit 0
+                ;;
+            -j|--json)
+                output_format="json"
+                shift
+                ;;
+            *)
+                echo "Error: unknown option: $1" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    case "${output_format}" in
+        table) output_table ;;
+        json)  output_json  ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

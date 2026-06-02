@@ -1,0 +1,186 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-02
+# Script: loginstat
+# Description:
+#   Display login session information similar to 'w' command but using
+#   loginctl as the backend. Shows user, session ID, login time, idle time,
+#   remote host, session type, and TTY/display information.
+#
+#   Steps:
+#     1. Parse command-line options (-j/--json, -h/--help).
+#     2. List sessions via 'loginctl list-sessions'.
+#     3. For each session, parse all fields in a single awk pass.
+#     4. Compute login time, idle duration, session type, and WHAT column.
+#     5. Print results in table or JSON format.
+#
+# Options:
+#   -h, --help    Show this help message and exit
+#   -j, --json    Output in JSON format
+#
+# Usage:
+#   loginstat
+#   loginstat --json
+#   loginstat --help
+#
+# Notes:
+#   - Requires loginctl (systemd) to be available.
+#   - Remote host is shown for SSH/remote sessions.
+#   - Session types: ssh, rdp, gui, tty, unknown
+#   - Sources '../lib/docstring.sh' for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../../lib/docstring.sh"
+
+# Parse all key=value fields from 'loginctl show-session' in a single awk pass.
+# Outputs: name|service|type|tty|display|leader|remote|timestamp|idle_hint|idle_since
+_parse_session() {
+    awk -F= '
+        /^Name=/         { name=$2 }
+        /^Service=/      { service=$2 }
+        /^Type=/         { type=$2 }
+        /^TTY=/          { tty=$2 }
+        /^Display=/      { display=$2 }
+        /^Leader=/       { leader=$2 }
+        /^RemoteHost=/   { remote=$2 }
+        /^Timestamp=/    { ts=$2 }
+        /^IdleHint=/     { idle_hint=$2 }
+        /^IdleSinceHint=/ { idle_since=$2 }
+        END { print name "|" service "|" type "|" tty "|" display "|" leader "|" remote "|" ts "|" idle_hint "|" idle_since }
+    '
+}
+
+# Format idle duration (microseconds since idle) as w-compatible string.
+# Args: $1=idle_hint  $2=idle_since_usec
+_idle_fmt() {
+    local idle_hint="$1"
+    local idle_since="${2:-0}"
+
+    if [[ "$idle_hint" != "yes" ]] || ! [[ "$idle_since" =~ ^[0-9]+$ ]] || (( idle_since <= 0 )); then
+        echo "."; return
+    fi
+
+    local now_usec idle_sec
+    now_usec=$(( $(date +%s) * 1000000 ))
+    idle_sec=$(( (now_usec - idle_since) / 1000000 ))
+
+    if (( idle_sec < 60 )); then
+        echo "."
+    elif (( idle_sec < 3600 )); then
+        echo "$((idle_sec/60))m"
+    elif (( idle_sec < 86400 )); then
+        printf "%d:%02d\n" $((idle_sec/3600)) $((idle_sec%3600/60))
+    else
+        echo "$((idle_sec/86400))days"
+    fi
+}
+
+# Map service/type to a display type string.
+# Args: $1=service  $2=type
+_type_disp() {
+    local service="$1" type="$2"
+    case "$service" in
+        sshd)                                          echo "ssh"; return ;;
+        xrdp-sesman)                                   echo "rdp"; return ;;
+        gdm-password|gdm-wayland-session|gdm-x-session) echo "gui"; return ;;
+    esac
+    if [[ "$type" == "x11" || "$type" == "wayland" ]]; then
+        echo "gui"
+    else
+        echo "${type:-unknown}"
+    fi
+}
+
+# Collect all fields for a session and output pipe-delimited record.
+get_session_info() {
+    local sid="$1"
+    local raw name service type tty_v display leader remote ts idle_hint idle_since
+
+    raw=$(loginctl show-session "$sid" | _parse_session)
+    IFS='|' read -r name service type tty_v display leader remote ts idle_hint idle_since <<< "$raw"
+
+    local login_time
+    login_time=$(date -d "$ts" "+%H:%M" 2>/dev/null || echo "-")
+
+    local idle
+    idle=$(_idle_fmt "$idle_hint" "$idle_since")
+
+    local from="${remote:--}"
+    local tdisp
+    tdisp=$(_type_disp "$service" "$type")
+
+    local what
+    if [[ -n "$tty_v" ]]; then
+        what="tty:$tty_v"
+    elif [[ -n "$display" ]]; then
+        what="display:$display"
+    else
+        what="pid:$leader"
+    fi
+
+    echo "$name|$sid|$login_time|$idle|$from|$tdisp|$what"
+}
+
+output_table() {
+    printf "%-20s %-8s %-8s %-8s %-16s %-8s %s\n" \
+        "USER" "SESSION" "LOGIN" "IDLE" "FROM" "TYPE" "WHAT"
+
+    while read -r sid _uid _user _seat _tty; do
+        local rec name session login_time idle from tdisp what
+        rec=$(get_session_info "$sid")
+        IFS='|' read -r name session login_time idle from tdisp what <<< "$rec"
+        printf "%-20s %-8s %-8s %-8s %-16s %-8s %s\n" \
+            "$name" "$session" "$login_time" "$idle" "$from" "$tdisp" "$what"
+    done < <(loginctl list-sessions --no-legend)
+}
+
+output_json() {
+    local first=1
+
+    echo "["
+    while read -r sid _uid _user _seat _tty; do
+        local rec name session login_time idle from tdisp what
+        rec=$(get_session_info "$sid")
+        IFS='|' read -r name session login_time idle from tdisp what <<< "$rec"
+
+        (( first )) || echo ","
+        first=0
+        printf '  {\n    "user": "%s",\n    "session": "%s",\n    "login": "%s",\n    "idle": "%s",\n    "from": "%s",\n    "type": "%s",\n    "what": "%s"\n  }' \
+            "$name" "$session" "$login_time" "$idle" "$from" "$tdisp" "$what"
+    done < <(loginctl list-sessions --no-legend)
+    (( first )) || echo
+    echo "]"
+}
+
+main() {
+    local output_format="table"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage_helper "$0"
+                exit 0
+                ;;
+            -j|--json)
+                output_format="json"
+                shift
+                ;;
+            *)
+                echo "Error: unknown option: $1" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    case "$output_format" in
+        table) output_table ;;
+        json)  output_json  ;;
+    esac
+}
+
+main "$@"

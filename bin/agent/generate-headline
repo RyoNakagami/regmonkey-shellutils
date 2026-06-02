@@ -35,7 +35,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
 # ---- Default values ----
 USE_CODEX=false
 MODEL=""
-CANDIDATE=2
+CANDIDATE=3
 POSITIONAL=()
 
 # ---- Parse options ----

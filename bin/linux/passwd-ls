@@ -1,0 +1,158 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-02
+# Script: passwd-ls
+# Description:
+#   Lists users from /etc/passwd with filtering options.
+#   By default, shows only human users (UID >= 1000).
+#
+# Options:
+#   -a, --all       Show all users
+#   -s, --system    Show only system users (UID < 1000)
+#   -u, --human     Show only human users (UID >= 1000) [default]
+#   -j, --json      Output in JSON format
+#   -h, --help      Show this help message and exit
+#
+# Usage:
+#   passwd-ls              # Show human users in table format
+#   passwd-ls -a           # Show all users
+#   passwd-ls -sj          # Show system users in JSON format (combined options)
+#   passwd-ls -s --json    # Show system users in JSON format
+#   passwd-ls --help       # Show this help message
+#
+# Notes:
+#   - Human users are defined as UID >= 1000 and < 65534
+#   - System users are defined as UID < 1000
+#   - Output includes username, UID, GID, home directory, and shell
+#   - Reads $PASSWD_FILE (default /etc/passwd); override it to inspect an
+#     alternate passwd-format file.
+#   - Sources '../../lib/docstring.sh' for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+
+PASSWD_FILE="${PASSWD_FILE:-/etc/passwd}"
+
+# ユーザー情報を取得する関数
+# mode ごとに UID フィルタだけを差し替え、出力本体は共通の awk で生成する。
+get_users() {
+    local mode="$1"
+    local filter
+    # single quotes keep '$3' literal for awk; shell must not expand it
+    # shellcheck disable=SC2016
+    case "${mode}" in
+        all)    filter='1' ;;
+        system) filter='$3 < 1000' ;;
+        human)  filter='$3 >= 1000 && $3 < 65534' ;;
+    esac
+    awk -F: "${filter} { print \$1\"|\"\$3\"|\"\$4\"|\"\$6\"|\"\$7 }" "${PASSWD_FILE}"
+}
+
+# テーブル形式で出力
+output_table() {
+    local mode="$1"
+    printf "%-20s %-6s %-6s %-25s %s\n" "USERNAME" "UID" "GID" "HOME" "SHELL"
+
+    get_users "${mode}" | while IFS='|' read -r username uid gid home shell; do
+        printf "%-20s %-6s %-6s %-25s %s\n" "${username}" "${uid}" "${gid}" "${home}" "${shell}"
+    done
+}
+
+# JSON形式で出力
+output_json() {
+    local mode="$1"
+    local entries=()
+
+    while IFS='|' read -r username uid gid home shell; do
+        entries+=("$(cat <<EOF
+  {
+    "username": "${username}",
+    "uid": ${uid},
+    "gid": ${gid},
+    "home": "${home}",
+    "shell": "${shell}"
+  }
+EOF
+)")
+    done < <(get_users "${mode}")
+
+    echo "["
+    local i
+    for i in "${!entries[@]}"; do
+        if (( i > 0 )); then
+            echo ","
+        fi
+        echo -n "${entries[${i}]}"
+    done
+    if (( ${#entries[@]} > 0 )); then
+        echo
+    fi
+    echo "]"
+}
+
+# メイン処理
+main() {
+    local mode="human"
+    local output_format="table"
+
+    # 長いオプションを短いオプションに変換
+    local args=()
+    for arg in "$@"; do
+        case "${arg}" in
+            --help)   args+=("-h") ;;
+            --all)    args+=("-a") ;;
+            --system) args+=("-s") ;;
+            --human)  args+=("-u") ;;
+            --json)   args+=("-j") ;;
+            *)        args+=("${arg}") ;;
+        esac
+    done
+
+    # getopts で短いオプションを解析（結合オプション対応: -sj, -aj など）
+    OPTIND=1
+    while getopts ":hasuj" opt "${args[@]}"; do
+        case "${opt}" in
+            h)
+                usage_helper "$0"
+                exit 0
+                ;;
+            a) mode="all" ;;
+            s) mode="system" ;;
+            u) mode="human" ;;
+            j) output_format="json" ;;
+            :)
+                echo "Option -${OPTARG} requires an argument." >&2
+                exit 1
+                ;;
+            \?)
+                echo "Unknown option: -${OPTARG}" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    # 残りの引数があればエラー
+    if [[ $# -gt 0 ]]; then
+        echo "Unexpected argument: $1" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    if [[ ! -r "${PASSWD_FILE}" ]]; then
+        echo "Error: cannot read passwd file: ${PASSWD_FILE}" >&2
+        exit 1
+    fi
+
+    case "${output_format}" in
+        table) output_table "${mode}" ;;
+        json) output_json "${mode}" ;;
+    esac
+}
+
+main "$@"
