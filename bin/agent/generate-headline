@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-02
+# Script: generate-headline
+# Description:
+#   入力テキストを3つの方向性（短縮・体言止め・スライド見出し）で言い換える。
+#   バックエンドに claude-stdin-prompt または codex-stdin-prompt を使用する。
+#
+#   echo "要約したい文章" | generate-headline
+#   generate-headline "要約したい文章"
+#   generate-headline < input.txt
+#   echo "テキスト" | generate-headline --codex --model o4-mini
+#
+# Options:
+#   --codex                   codex-stdin-prompt を使用 (デフォルト: claude-stdin-prompt)
+#   --model, -m <model>       使用するモデル
+#                             claude 時のデフォルト: sonnet
+#                             codex 時のデフォルト: (codex のデフォルト)
+#   --candidate, -n <number>  各方向の提案数 (デフォルト: 3)
+#   -h, --help                このヘルプを表示
+#
+# Notes:
+#   - 引数として入力テキストを渡すか、stdin からパイプ/リダイレクトで与える。
+#   - --codex 時は stdin を TTY から起動しないこと（codex の制約）。
+#   - Sources '../../lib/docstring.sh' for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+USE_CODEX=false
+MODEL=""
+CANDIDATE=2
+POSITIONAL=()
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage_helper
+            exit 0
+            ;;
+        --codex)
+            USE_CODEX=true
+            shift
+            ;;
+        --model|-m)
+            [[ $# -ge 2 ]] || { echo "Error: $1 requires an argument." >&2; exit 1; }
+            MODEL="$2"
+            shift 2
+            ;;
+        --model=*|-m=*)
+            MODEL="${1#*=}"
+            shift
+            ;;
+        --candidate|-n)
+            [[ $# -ge 2 ]] || { echo "Error: $1 requires an argument." >&2; exit 1; }
+            CANDIDATE="$2"
+            shift 2
+            ;;
+        --candidate=*|-n=*)
+            CANDIDATE="${1#*=}"
+            shift
+            ;;
+        --)
+            shift
+            POSITIONAL+=("$@")
+            break
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# ---- Validate --candidate ----
+[[ "$CANDIDATE" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Error: --candidate must be a positive integer, got: $CANDIDATE" >&2
+    exit 1
+}
+
+# ---- 入力取得 (引数 or stdin) ----
+if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
+    INPUT="${POSITIONAL[*]}"
+    STDIN_SOURCE="arg"
+else
+    INPUT=""
+    STDIN_SOURCE="stdin"
+fi
+
+if [[ "$STDIN_SOURCE" == "arg" && -z "${INPUT// /}" ]]; then
+    echo "Error: 入力が空です" >&2
+    exit 1
+fi
+
+# ---- プロンプト本文 ----
+PROMPT="あなたはプロフェッショナルビジネスコンサルタントです。以下の文章を、3つの異なる方向性で簡潔にまとめてください。
+
+【方向性】
+1. **短くする方向**: 元の意味を保ったまま文字数を削る。語順や接続をそのまま、冗長な部分だけ落とす。
+2. **体言止めで引き締める方向**: 文末を体言止め・名詞句にして硬く・密度高く。
+3. **スライドの見出しっぽく**: 一目で意味が掴めるキャッチー短文。記号(=、≒、→ など)や対比構造も活用可。
+
+各方向につき${CANDIDATE}案ずつ提示してください。出力は以下の形式で、前置き・後書きは一切不要です。
+
+## 短くする方向
+- 案1
+- 案2
+
+## 体言止めで引き締める方向
+- 案1
+- 案2
+
+## スライドの見出しっぽく
+- 案1
+- 案2"
+
+# ---- バックエンド選択 ----
+if $USE_CODEX; then
+    AGENT="$(dirname "${BASH_SOURCE[0]}")/codex-stdin-prompt"
+else
+    AGENT="$(dirname "${BASH_SOURCE[0]}")/claude-stdin-prompt"
+fi
+
+[[ -x "$AGENT" ]] || { echo "Error: agent not found or not executable: $AGENT" >&2; exit 1; }
+
+AGENT_ARGS=(-p "$PROMPT")
+[[ -n "$MODEL" ]] && AGENT_ARGS+=(--model "$MODEL")
+
+# ---- 呼び出し ----
+if [[ "$STDIN_SOURCE" == "arg" ]]; then
+    echo "$INPUT" | "$AGENT" "${AGENT_ARGS[@]}"
+else
+    "$AGENT" "${AGENT_ARGS[@]}"
+fi
