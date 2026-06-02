@@ -1,0 +1,170 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-02
+# Script: convert_to_uploadable_mp4
+# Description:
+#   Transcodes a video into a widely-compatible, upload-ready MP4 using ffmpeg.
+#
+#   The output is encoded so it plays "anywhere" (browsers, social platforms,
+#   mobile devices, presentation tools) by enforcing:
+#     - H.264 video (libx264) with yuv420p chroma subsampling
+#     - A baseline-friendly profile/level for broad device support
+#     - AAC audio
+#     - '+faststart' so the moov atom sits at the front of the file,
+#       enabling progressive download / instant playback while uploading.
+#
+#   Steps:
+#     1. Parse command-line options (-c CRF, -s max scale, -o output path,
+#        -y force-overwrite, -h help).
+#     2. Validate ffmpeg is available and the input file exists/readable.
+#     3. Validate the CRF and scale arguments.
+#     4. Validate the output path does not collide with an existing file
+#        unless -y is given.
+#     5. Invoke ffmpeg with compatibility-first encoding flags.
+#
+# Options:
+#    -c <num>   H.264 CRF quality, 0-51 (lower = better/larger; default: 18)
+#    -s <num>   Downscale so the longer side is at most <num> px, preserving
+#               aspect ratio (even-dimension safe). Omit to keep original size.
+#    -o <path>  Output MP4 path (default: <INPUT stem>_uploadable.mp4)
+#    -y         Overwrite output file if it already exists
+#    -h         Show this help message
+#
+# Usage:
+#   ./convert_to_uploadable_mp4 input.mov
+#   ./convert_to_uploadable_mp4 -c 20 -o out.mp4 input.mkv
+#   ./convert_to_uploadable_mp4 -s 1080 -y -o small.mp4 input.mp4
+#
+# Notes:
+#   - Requires 'ffmpeg' on PATH.
+#   - Sources '../lib/docstring.sh' for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+CRF=18
+SCALE=""
+OUTPUT=""
+FORCE=false
+INPUT=""
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h)
+      usage_helper
+      exit 0
+      ;;
+    -c)
+      CRF="${2:-}"
+      shift 2
+      ;;
+    -s)
+      SCALE="${2:-}"
+      shift 2
+      ;;
+    -o)
+      OUTPUT="${2:-}"
+      shift 2
+      ;;
+    -y)
+      FORCE=true
+      shift
+      ;;
+    -*)
+      echo "Error: unknown option: $1" >&2
+      usage_helper
+      exit 1
+      ;;
+    *)
+      if [[ -n "$INPUT" ]]; then
+        echo "Error: only one input file is accepted (got extra: $1)" >&2
+        exit 1
+      fi
+      INPUT="$1"
+      shift
+      ;;
+  esac
+done
+
+# ---- Validate dependencies ----
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "Error: 'ffmpeg' is not installed or not on PATH." >&2
+  exit 1
+fi
+
+# ---- Validate input file ----
+if [[ -z "$INPUT" ]]; then
+  echo "Error: input video path is required." >&2
+  usage_helper
+  exit 1
+fi
+
+if [[ ! -f "$INPUT" ]]; then
+  echo "Error: input file does not exist: $INPUT" >&2
+  exit 1
+fi
+
+if [[ ! -r "$INPUT" ]]; then
+  echo "Error: input file is not readable: $INPUT" >&2
+  exit 1
+fi
+
+# ---- Validate CRF ----
+if ! [[ "$CRF" =~ ^[0-9]+$ ]] || (( CRF > 51 )); then
+  echo "Error: -c (CRF) must be an integer in 0-51 (got: $CRF)" >&2
+  exit 1
+fi
+
+# ---- Validate scale ----
+if [[ -n "$SCALE" ]] && ! [[ "$SCALE" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Error: -s (max long side) must be a positive integer (got: $SCALE)" >&2
+  exit 1
+fi
+
+# ---- Resolve output path ----
+if [[ -z "$OUTPUT" ]]; then
+  base="$(basename "$INPUT")"
+  stem="${base%.*}"
+  OUTPUT="${stem}_uploadable.mp4"
+fi
+
+# ---- Validate output collision ----
+if [[ -e "$OUTPUT" ]] && ! $FORCE; then
+  echo "Error: output file already exists: $OUTPUT (use -y to overwrite)" >&2
+  exit 1
+fi
+
+# ---- Build optional video filter ----
+# Force even dimensions (required by yuv420p) and optionally cap the long side.
+VF_ARGS=()
+if [[ -n "$SCALE" ]]; then
+  # Downscale the longer side to at most $SCALE, keep aspect, round to even.
+  VF_ARGS=(-vf "scale='if(gt(iw,ih),min(iw,${SCALE}),-2)':'if(gt(iw,ih),-2,min(ih,${SCALE}))'")
+else
+  # Always guarantee even dimensions so yuv420p never fails.
+  VF_ARGS=(-vf "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+fi
+
+# ---- Run ffmpeg ----
+# We have already guarded output collisions above; -n keeps ffmpeg from
+# silently re-prompting, while -y is passed only when the user forced overwrite.
+OVERWRITE_FLAG="-n"
+if $FORCE; then
+  OVERWRITE_FLAG="-y"
+fi
+
+ffmpeg "$OVERWRITE_FLAG" -i "$INPUT" \
+  -c:v libx264 -pix_fmt yuv420p -profile:v high -level 4.0 \
+  -crf "$CRF" -preset medium \
+  "${VF_ARGS[@]}" \
+  -c:a aac -b:a 128k \
+  -movflags +faststart \
+  "$OUTPUT"
+
+echo "Wrote: $OUTPUT (H.264/AAC, CRF ${CRF}${SCALE:+, max side ${SCALE}px} from $INPUT)"
