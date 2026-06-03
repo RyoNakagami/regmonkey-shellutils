@@ -1,0 +1,91 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-03
+# Script: isoweek
+# Description:
+#   Calculates the ISO week number for a given datetime string.
+#   Supports UTC or local time calculation via options.
+#
+#   Steps:
+#     1. Parse options (-u for UTC, -h for help) and collect positionals.
+#     2. Validate that exactly one datetime argument is provided.
+#     3. Check the datetime format for validity.
+#     4. Calculate ISO week number using 'date' (UTC or local).
+#     5. Output the ISO week number.
+#
+# Options:
+#    -u, --utc     Calculate using UTC time
+#    -h, --help    Show this help message
+#
+# Usage:
+#   ./isoweek 2025-01-03            # Show ISO week for given date
+#   ./isoweek -u 2025-01-03         # Show ISO week in UTC
+#
+# Notes:
+#   - Requires 'date' command (GNU coreutils).
+#   - Sources lib/docstring.sh for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+USE_UTC=false
+positionals=()
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+  case "${1}" in
+    -h|--help )
+      # shellcheck disable=SC2119
+      usage_helper
+      exit 0
+      ;;
+    -u|--utc )
+      USE_UTC=true
+      shift
+      ;;
+    -* )
+      echo "Error: unknown option: ${1}" >&2
+      usage_helper
+      exit 1
+      ;;
+    * )
+      positionals+=("${1}")
+      shift
+      ;;
+  esac
+done
+
+# ---- Validate ----
+if [[ ${#positionals[@]} -lt 1 ]]; then
+  echo "Error: DATETIME argument is required." >&2
+  echo "       Try: ${0} 2025-01-03" >&2
+  exit 1
+fi
+
+if [[ ${#positionals[@]} -gt 1 ]]; then
+  echo "Error: too many arguments: expected exactly one DATETIME." >&2
+  exit 1
+fi
+
+DATETIME="${positionals[0]}"
+
+if ! date -d "${DATETIME}" >/dev/null 2>&1; then
+  echo "Error: Invalid datetime format: '${DATETIME}'" >&2
+  echo "       Example: 2025-01-03 or 2024-12-30T00:00:00+09:00" >&2
+  exit 1
+fi
+
+# ---- Run ----
+if ${USE_UTC}; then
+  ISO_WEEK=$(date -u -d "${DATETIME}" +%V)
+else
+  ISO_WEEK=$(date -d "${DATETIME}" +%V)
+fi
+
+echo "${ISO_WEEK}"
