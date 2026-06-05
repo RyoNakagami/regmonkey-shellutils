@@ -1,5 +1,6 @@
 
-
+![OS](https://img.shields.io/badge/OS-Linux-lightgrey)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ```zsh
 # 1. Clone
