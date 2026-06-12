@@ -1,0 +1,151 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-12
+# Script: check-memory
+# Description:
+#   This script displays memory and swap usage in a bar graph format.
+#
+#   Steps:
+#     1. Parse command-line options to determine the unit of measurement.
+#     2. Fetch memory and swap usage data using the `free` command.
+#     3. Calculate bar lengths (a total of 0 renders an empty bar).
+#     4. Display usage as bar graphs for memory and swap.
+#
+# Options:
+#   -b, --bytes      Display memory usage in bytes
+#   -k, --kilo       Display memory usage in kilobytes
+#   -m, --mega       Display memory usage in megabytes (default)
+#   -g, --giga       Display memory usage in gigabytes
+#   -v, --version    Show version and exit
+#   -h, --help       Show this help message and exit
+#
+# Usage:
+#   check-memory                  # Displays memory usage in MB by default
+#   check-memory -g               # Displays memory usage in GB
+#   watch -n 5 check-memory -g    # Updates every 5 seconds, displaying in GB
+#
+# Notes:
+#   - Requires `free` and `awk` (Linux / procps).
+#   - Works on hosts without swap (renders an empty bar instead of failing).
+#   - Sources '../../lib/docstring.sh' and '../../lib/version.sh'.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+source "${SCRIPT_DIR}/../../lib/version.sh"
+
+BAR_LENGTH=40
+
+# value/total を '[####    ]'（角括弧内 BAR_LENGTH 桁）に整形する。
+# total=0 のときはゼロ除算せずバー 0 本で描画する。
+render_bar() {
+    local value="$1"
+    local total="$2"
+    local filled=0
+    if (( total > 0 )); then
+        filled=$(( value * BAR_LENGTH / total ))
+    fi
+    (( filled > BAR_LENGTH )) && filled=${BAR_LENGTH}
+
+    local bar=""
+    if (( filled > 0 )); then
+        bar="$(printf '%*s' "${filled}" '' | tr ' ' '#')"
+    fi
+    printf '[%s%*s]' "${bar}" "$(( BAR_LENGTH - filled ))" ''
+}
+
+# メモリ/スワップのバーグラフを表示する
+print_usage_bars() {
+    local unit="$1"
+    local unit_label="$2"
+
+    local free_output
+    if ! free_output="$(free "-${unit}")"; then
+        echo "Error: failed to fetch memory info with 'free -${unit}'" >&2
+        exit 1
+    fi
+
+    local total used free_v buff available
+    read -r total used free_v buff available \
+        <<< "$(awk 'NR==2{print $2,$3,$4,$6,$7}' <<< "${free_output}")"
+    local swap_total swap_used swap_free
+    read -r swap_total swap_used swap_free \
+        <<< "$(awk 'NR==3{print $2,$3,$4}' <<< "${free_output}")"
+
+    echo "Memory Usage (${unit_label}): Total ${total}"
+    printf 'Used      %s %d\n' "$(render_bar "${used}" "${total}")" "${used}"
+    printf 'Buff/Cache%s %d\n' "$(render_bar "${buff}" "${total}")" "${buff}"
+    printf 'Free      %s %d\n' "$(render_bar "${free_v}" "${total}")" "${free_v}"
+    printf 'Available %s %d\n' "$(render_bar "${available}" "${total}")" "${available}"
+
+    echo ""
+    echo "Swap Usage (${unit_label}): Total ${swap_total}"
+    printf 'Used %s %d\n' "$(render_bar "${swap_used}" "${swap_total}")" "${swap_used}"
+    printf 'Free %s %d\n' "$(render_bar "${swap_free}" "${swap_total}")" "${swap_free}"
+}
+
+# メイン処理
+main() {
+    local unit="m"
+    local unit_label="MB"
+
+    # 長いオプションを短いオプションに変換
+    local args=()
+    for arg in "$@"; do
+        case "${arg}" in
+            --help)    args+=("-h") ;;
+            --version) args+=("-v") ;;
+            --bytes)   args+=("-b") ;;
+            --kilo)    args+=("-k") ;;
+            --mega)    args+=("-m") ;;
+            --giga)    args+=("-g") ;;
+            *)         args+=("${arg}") ;;
+        esac
+    done
+
+    OPTIND=1
+    while getopts ":hvbkmg" opt "${args[@]}"; do
+        case "${opt}" in
+            h)
+                usage_helper "$0"
+                exit 0
+                ;;
+            v)
+                print_version
+                exit 0
+                ;;
+            b) unit="b"; unit_label="B" ;;
+            k) unit="k"; unit_label="KB" ;;
+            m) unit="m"; unit_label="MB" ;;
+            g) unit="g"; unit_label="GB" ;;
+            \?)
+                echo "Error: unknown option: -${OPTARG}" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    # 残りの引数があればエラー
+    if [[ $# -gt 0 ]]; then
+        echo "Error: unexpected argument: $1" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    local cmd
+    for cmd in free awk; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            echo "Error: required command not found: ${cmd}" >&2
+            exit 1
+        fi
+    done
+
+    print_usage_bars "${unit}" "${unit_label}"
+}
+
+main "$@"
