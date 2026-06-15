@@ -1,0 +1,109 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-15
+# Script: fetch-globalip
+# Description:
+#   Fetch the current global (public) IP address. By default the full
+#   response from ifconfig.co is returned as JSON (pretty-printed via 'jq'
+#   when available). With --v4 the script returns only the plain IPv4
+#   address from inet-ip.info.
+#
+#   Steps:
+#     1. Parse options (--v4, -t/--timeout, -h).
+#     2. Verify 'curl' is available; in JSON mode warn (and degrade to raw
+#        output) when 'jq' is missing.
+#     3. Query the appropriate endpoint with a curl timeout.
+#     4. Print the result (pretty JSON, raw JSON, or plain IPv4).
+#
+# Options:
+#   --v4                 Use IPv4 only (queries inet-ip.info).
+#   -t, --timeout SEC    curl timeout in seconds (default: 5).
+#   -h, --help           Show this help message.
+#
+# Usage:
+#   fetch-globalip            # Full JSON from ifconfig.co
+#   fetch-globalip --v4       # Plain IPv4 from inet-ip.info
+#   fetch-globalip -t 10      # JSON with a 10-second timeout
+#
+# Exit Codes:
+#   0   IP address fetched successfully.
+#   1   Invalid usage or the request failed.
+#
+# Notes:
+#   - Requires 'curl'. 'jq' is optional and only used to pretty-print JSON.
+#   - Requires an active internet connection at runtime.
+#   - Sources lib/docstring.sh for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+USE_V4=false
+TIMEOUT="5"
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --v4)
+    USE_V4=true
+    shift
+    ;;
+  -t | --timeout)
+    if [[ -n "${2:-}" && "$2" =~ ^[0-9]+$ ]]; then
+      TIMEOUT="$2"
+      shift 2
+    else
+      echo "Error: --timeout requires a numeric argument." >&2
+      usage_helper
+      exit 1
+    fi
+    ;;
+  -h | --help)
+    usage_helper
+    exit 0
+    ;;
+  -*)
+    echo "Error: unknown option: $1" >&2
+    usage_helper
+    exit 1
+    ;;
+  *)
+    echo "Error: no positional arguments are accepted (got '$1')." >&2
+    usage_helper
+    exit 1
+    ;;
+  esac
+done
+
+# ---- Validate dependencies ----
+if ! command -v curl >/dev/null 2>&1; then
+  echo "Error: 'curl' command not found in PATH." >&2
+  exit 1
+fi
+
+# ---- Run ----
+if [[ "${USE_V4}" == true ]]; then
+  echo "Using inet-ip.info..." >&2
+  if ! IP=$(curl -4 --fail --silent --show-error --max-time "${TIMEOUT}" inet-ip.info); then
+    echo "Error: failed to fetch IPv4 address." >&2
+    exit 1
+  fi
+  echo "${IP}"
+else
+  if ! RESPONSE=$(curl --fail --silent --show-error --max-time "${TIMEOUT}" \
+    -H 'Accept: application/json' ifconfig.co); then
+    echo "Error: failed to fetch global IP address." >&2
+    exit 1
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    echo "${RESPONSE}" | jq
+  else
+    echo "Warning: 'jq' is not installed; output will not be formatted." >&2
+    echo "${RESPONSE}"
+  fi
+fi
