@@ -1,0 +1,184 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-15
+# Script: utf8ify
+# Description:
+#   Converts a text file to UTF-8 encoding using 'iconv'.
+#
+#   Steps:
+#     1. Parse command-line options.
+#     2. Validate that the input file exists and is readable.
+#     3. Determine the source encoding (explicit --encoding, nkf guess,
+#        or automatic detection via uchardet/file).
+#     4. Optionally create a '*.bak' backup of the original file.
+#     5. Convert the file to UTF-8 in place (skipped if already UTF-8).
+#
+# Options:
+#   -e, --encoding <enc>  Treat the file as <enc> instead of detecting it
+#                         (e.g. SHIFT_JIS, EUC-JP, ISO-8859-1)
+#   -n, --nkf             Detect the encoding with 'nkf --guess'
+#   -b, --backup          Create a backup of the original file (*.bak)
+#   -v, --version         Show version and exit
+#   -h, --help            Show this help message and exit
+#
+# Usage:
+#   utf8ify input.txt                       # Detect encoding and convert
+#   utf8ify -b input.txt                    # Keep a *.bak backup
+#   utf8ify -n input.txt                    # Use nkf to guess the encoding
+#   utf8ify -e SHIFT_JIS input.txt          # Force the source encoding
+#   utf8ify --encoding=EUC-JP input.txt     # '--opt=value' form is accepted
+#
+# Notes:
+#   - Requires 'iconv'. Detection uses 'uchardet' or 'file' (or 'nkf' with -n).
+#   - Sources '../../lib/docstring.sh' and '../../lib/version.sh'.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+source "${SCRIPT_DIR}/../../lib/version.sh"
+
+# ファイルの文字エンコーディングを推定して標準出力に返す。
+# method=nkf なら 'nkf --guess'、それ以外は uchardet→file の順で判定する。
+detect_encoding() {
+    local file="$1"
+    local method="$2"
+
+    if [[ "${method}" == "nkf" ]]; then
+        nkf --guess "${file}" | awk '{print $1}'
+    elif command -v uchardet >/dev/null 2>&1; then
+        uchardet "${file}"
+    else
+        file -b --mime-encoding "${file}"
+    fi
+}
+
+# メイン処理
+main() {
+    local backup=false
+    local method="auto"
+    local encoding=""
+
+    # 長いオプションを短いオプションに変換
+    local args=()
+    local arg
+    for arg in "$@"; do
+        case "${arg}" in
+            --help)       args+=("-h") ;;
+            --version)    args+=("-v") ;;
+            --backup)     args+=("-b") ;;
+            --nkf)        args+=("-n") ;;
+            --encoding)   args+=("-e") ;;
+            --encoding=*) args+=("-e" "${arg#*=}") ;;
+            *)            args+=("${arg}") ;;
+        esac
+    done
+
+    set -- "${args[@]}"
+    OPTIND=1
+    while getopts ":hvbne:" opt; do
+        case "${opt}" in
+            h)
+                usage_helper "$0"
+                exit 0
+                ;;
+            v)
+                print_version
+                exit 0
+                ;;
+            b) backup=true ;;
+            n) method="nkf" ;;
+            e) encoding="${OPTARG}" ;;
+            :)
+                echo "Error: option -${OPTARG} requires an argument." >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+            \?)
+                echo "Error: unknown option: -${OPTARG}" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    # ファイル指定チェック
+    if [[ $# -eq 0 ]]; then
+        echo "Error: no input file specified." >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+    local file="$1"
+    shift
+
+    # 残りの引数があればエラー
+    if [[ $# -gt 0 ]]; then
+        echo "Error: unexpected argument: $1" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    if [[ ! -f "${file}" ]]; then
+        echo "Error: file not found: ${file}" >&2
+        exit 1
+    fi
+
+    # 依存コマンドチェック
+    if ! command -v iconv >/dev/null 2>&1; then
+        echo "Error: required command not found: iconv" >&2
+        exit 1
+    fi
+
+    # エンコーディング決定（--encoding が最優先、なければ推定）
+    if [[ -n "${encoding}" ]]; then
+        echo "Using specified encoding: ${encoding}"
+    else
+        if [[ "${method}" == "nkf" ]] && ! command -v nkf >/dev/null 2>&1; then
+            echo "Error: required command not found: nkf" >&2
+            exit 1
+        fi
+        if [[ "${method}" == "auto" ]] \
+            && ! command -v uchardet >/dev/null 2>&1 \
+            && ! command -v file >/dev/null 2>&1; then
+            echo "Error: no encoding detector found (need uchardet or file)." >&2
+            echo "Hint: pass --encoding <enc> to set it explicitly." >&2
+            exit 1
+        fi
+        encoding="$(detect_encoding "${file}" "${method}")"
+        echo "Detected encoding: ${encoding}"
+    fi
+
+    if [[ -z "${encoding}" ]]; then
+        echo "Error: could not determine the source encoding of ${file}" >&2
+        echo "Hint: pass --encoding <enc> to set it explicitly." >&2
+        exit 1
+    fi
+
+    # バックアップ処理
+    if [[ "${backup}" == true ]]; then
+        cp "${file}" "${file}.bak"
+        echo "Backup created: ${file}.bak"
+    fi
+
+    # UTF-8 に変換（大文字小文字を無視して既に UTF-8 ならスキップ）
+    local enc_upper="${encoding^^}"
+    if [[ "${enc_upper}" == "UTF-8" || "${enc_upper}" == "UTF8" ]]; then
+        echo "No conversion needed: ${file} is already UTF-8."
+        return 0
+    fi
+
+    echo "Converting ${file} from ${encoding} to UTF-8..."
+    if iconv -f "${encoding}" -t UTF-8 "${file}" -o "${file}.utf8"; then
+        mv "${file}.utf8" "${file}"
+        echo "Conversion complete: ${file} is now UTF-8 encoded."
+    else
+        rm -f "${file}.utf8"
+        echo "Error: failed to convert ${file} from ${encoding} to UTF-8." >&2
+        exit 1
+    fi
+}
+
+main "$@"
