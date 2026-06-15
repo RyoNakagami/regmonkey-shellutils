@@ -1,0 +1,221 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-15
+# Script: show-colors
+# Description:
+#   Displays a table of named colors and their hex codes, rendering each name
+#   in its own color using 24-bit (truecolor) ANSI escape sequences. With
+#   --json, exports the selected palette as a JSON object instead of a table.
+#
+#   Steps:
+#     1. Parse command-line options to choose the palette and output format.
+#     2. Load the palette from the YAML config (config/color_config.yml).
+#     3. Table mode: convert each hex to "R;G;B" and print a two-column table.
+#        JSON mode: emit a sorted {"name": "#hex", ...} object.
+#
+# Options:
+#   -p, --palette NAME   Palette to display: 'default' or 'regmonkey'
+#                        (default: default)
+#   -j, --json           Output the palette as JSON instead of a table
+#   -v, --version        Show version and exit
+#   -h, --help           Show this help message and exit
+#
+# Usage:
+#   show-colors                    # Show the default palette as a table
+#   show-colors -p regmonkey       # Show the regmonkey palette
+#   show-colors --palette default  # Same as the default invocation
+#   show-colors --json             # Export the default palette as JSON
+#   show-colors -p regmonkey -j    # Export the regmonkey palette as JSON
+#
+# Notes:
+#   - Requires `yamlcli` and `jq`.
+#   - Requires a terminal that supports 24-bit truecolor ANSI escapes.
+#   - The config file is resolved relative to this script
+#     (config/color_config.yml).
+#   - Sources '../../lib/docstring.sh' and '../../lib/version.sh'.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+source "${SCRIPT_DIR}/../../lib/version.sh"
+
+# config/color_config.yml is resolved relative to this script unless overridden
+# via the CONFIG_FILE environment variable (used by tests).
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/config/color_config.yml}"
+
+# "#RRGGBB" を ANSI 用の "R;G;B"（10進）に変換する。
+hex_to_rgb() {
+    local hex="$1"
+    local red green blue
+    red="$(printf '%s' "${hex}" | cut -c2-3)"
+    green="$(printf '%s' "${hex}" | cut -c4-5)"
+    blue="$(printf '%s' "${hex}" | cut -c6-7)"
+    printf '%d;%d;%d' "$((16#${red}))" "$((16#${green}))" "$((16#${blue}))"
+}
+
+# 指定パレットの "name=#hex" 行を名前昇順で読み込む。
+load_palette() {
+    local palette="$1"
+    yamlcli --to-json "${CONFIG_FILE}" \
+        | jq -r --arg p "${palette}" \
+            '.[$p].x11_css4_colors | to_entries[] | "\(.key)=\(.value)"' \
+        | sort
+}
+
+# 指定パレットを {"name": "#hex", ...} の JSON として出力する（キー昇順）。
+print_color_json() {
+    local palette="$1"
+    yamlcli --to-json "${CONFIG_FILE}" \
+        | jq --sort-keys --arg p "${palette}" '.[$p].x11_css4_colors'
+}
+
+# 1セル分（着色した名前 + パディング + hex）を出力する。可視幅は引数で固定し、
+# ANSI エスケープを含むためターミナル側の幅計算には依存しない。
+print_cell() {
+    local name="$1" hex="$2" name_width="$3"
+    local rgb pad
+    rgb="$(hex_to_rgb "${hex}")"
+    # 名前の可視幅を name_width に揃えるパディング（着色対象外）。
+    pad="$(printf '%*s' "$(( name_width - ${#name} ))" '')"
+    printf '\033[38;2;%sm%s\033[0m%s  %-9s' "${rgb}" "${name}" "${pad}" "${hex}"
+}
+
+# パレットを2列のテーブルに整形して表示する。
+print_color_table() {
+    local palette="$1"
+
+    # 全エントリを配列に読み込み、名前の最大長を求める。
+    local -a names=() hexes=()
+    local name hex name_width=10
+    while IFS='=' read -r name hex; do
+        if [[ -z "${name}" ]]; then
+            continue
+        fi
+        names+=("${name}")
+        hexes+=("${hex}")
+        if (( ${#name} > name_width )); then
+            name_width=${#name}
+        fi
+    done < <(load_palette "${palette}")
+
+    local count=${#names[@]}
+    if (( count == 0 )); then
+        echo "Error: palette '${palette}' has no colors" >&2
+        return 1
+    fi
+
+    # ヘッダ（データ行と同じ列幅で揃える）。各セルの可視幅は
+    # name_width + 2(空白) + 9(hex) = name_width + 11。
+    local header_cell
+    header_cell="$(printf '%-*s  %-9s' "${name_width}" "Color Name" "Hex")"
+    local header_sep
+    header_sep="$(printf '%*s' "$(( name_width + 13 ))" '' | tr ' ' '-')"
+    printf '| %s | %s |\n' "${header_cell}" "${header_cell}"
+    printf '|%s|%s|\n' "${header_sep}" "${header_sep}"
+
+    # 左列を上半分、右列を下半分に割り当てて2列で並べる。
+    local mid=$(( (count + 1) / 2 ))
+    local i j
+    for (( i = 0; i < mid; i++ )); do
+        printf '| '
+        print_cell "${names[i]}" "${hexes[i]}" "${name_width}"
+        j=$(( i + mid ))
+        if (( j < count )); then
+            printf ' | '
+            print_cell "${names[j]}" "${hexes[j]}" "${name_width}"
+            printf ' |\n'
+        else
+            # 右セルが無い場合は同じ可視幅（name_width + 11）の空欄で埋める。
+            printf ' | %*s |\n' "$(( name_width + 11 ))" ''
+        fi
+    done
+}
+
+# メイン処理
+main() {
+    local palette="default"
+    local output_json=0
+
+    # 長いオプションを短いオプションに変換
+    local args=()
+    local arg
+    for arg in "$@"; do
+        case "${arg}" in
+            --help)    args+=("-h") ;;
+            --version) args+=("-v") ;;
+            --palette) args+=("-p") ;;
+            --json)    args+=("-j") ;;
+            *)         args+=("${arg}") ;;
+        esac
+    done
+
+    OPTIND=1
+    while getopts ":hvjp:" opt "${args[@]}"; do
+        case "${opt}" in
+            h)
+                usage_helper "$0"
+                exit 0
+                ;;
+            v)
+                print_version
+                exit 0
+                ;;
+            j) output_json=1 ;;
+            p) palette="${OPTARG}" ;;
+            :)
+                echo "Error: option -${OPTARG} requires an argument." >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+            \?)
+                echo "Error: unknown option: -${OPTARG}" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    # 残りの引数があればエラー
+    if [[ $# -gt 0 ]]; then
+        echo "Error: unexpected argument: $1" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    # パレット名を YAML の実キーへ正規化
+    case "${palette}" in
+        default)            palette="default" ;;
+        regmonkey)          palette="regmonkey_colors" ;;
+        regmonkey_colors)   palette="regmonkey_colors" ;;
+        *)
+            echo "Error: unknown palette: ${palette}" >&2
+            echo "Valid palettes: default, regmonkey" >&2
+            exit 1
+            ;;
+    esac
+
+    local cmd
+    for cmd in yamlcli jq; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            echo "Error: required command not found: ${cmd}" >&2
+            exit 1
+        fi
+    done
+
+    if [[ ! -r "${CONFIG_FILE}" ]]; then
+        echo "Error: cannot read config file: ${CONFIG_FILE}" >&2
+        exit 1
+    fi
+
+    if (( output_json )); then
+        print_color_json "${palette}"
+    else
+        print_color_table "${palette}"
+    fi
+}
+
+main "$@"
