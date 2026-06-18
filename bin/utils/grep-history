@@ -1,0 +1,143 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-18
+# Script: grep-history
+# Description:
+#   This script searches the zsh history file for a pattern and prints the
+#   matching commands with their timestamps in a human-readable form.
+#
+#   Steps:
+#     1. Parse command-line options and the search pattern.
+#     2. Resolve the history file (-f|--file overrides $HISTORYFILE).
+#     3. Grep the history file for the pattern.
+#     4. Reformat each match as 'YYYY-MM-DD HH:MM:SS: <command>'.
+#
+# Options:
+#   -f, --file FILE  History file to search (default: $HISTORYFILE)
+#   -v, --version    Show version and exit
+#   -h, --help       Show this help message and exit
+#
+# Usage:
+#   grep-history docker            # Show history entries containing 'docker'
+#   grep-history 'git.*rebase'     # grep accepts basic regular expressions
+#   grep-history -f ~/.bak docker  # Search an explicit history file
+#
+# Notes:
+#   - Reads the zsh EXTENDED_HISTORY format: ': <timestamp>:<elapsed>;<command>'.
+#   - Requires `grep` and `awk`.
+#   - Set the environment variable HISTORYFILE to your HISTFILE path
+#     (typically exported in ~/.zshrc), or pass it with -f|--file.
+#   - Sources '../../lib/docstring.sh' and '../../lib/version.sh'.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+source "${SCRIPT_DIR}/../../lib/version.sh"
+
+# 履歴ファイルから pattern にマッチした行を抽出し、
+# 'YYYY-MM-DD HH:MM:SS: <command>' に整形して表示する。
+search_history() {
+    local pattern="$1"
+    local histfile="$2"
+
+    if [[ ! -r "${histfile}" ]]; then
+        echo "Error: cannot read history file: ${histfile}" >&2
+        exit 1
+    fi
+
+    # grep が 1 件もマッチしないと exit 1 を返すが、それはエラーではないので
+    # set -e に巻き込まれないよう `|| true` で握りつぶす（パイプ先の awk が
+    # 空入力を素直に処理する）。
+    { grep -e "${pattern}" "${histfile}" || true; } |
+    awk '
+        # EXTENDED_HISTORY 形式: ": <ts>:<elapsed>;<command>"
+        # 先頭のメタ情報だけを正規表現で剥がし、コマンドは無加工で残す。
+        match($0, /^: [0-9]+:[0-9]+;/) {
+            ts = $0
+            sub(/^: /, "", ts)
+            sub(/:.*/, "", ts)
+            command = substr($0, RLENGTH + 1)
+            print strftime("%Y-%m-%d %H:%M:%S", ts) ": " command
+            next
+        }
+        # メタ情報の無い行（古い形式など）はそのまま表示する。
+        { print }
+    '
+}
+
+# メイン処理
+main() {
+    local histfile="${HISTORYFILE:-}"
+
+    # 長いオプションを短いオプションに変換
+    local args=()
+    for arg in "$@"; do
+        case "${arg}" in
+            --help)    args+=("-h") ;;
+            --version) args+=("-v") ;;
+            --file)    args+=("-f") ;;
+            *)         args+=("${arg}") ;;
+        esac
+    done
+
+    OPTIND=1
+    while getopts ":hvf:" opt "${args[@]}"; do
+        case "${opt}" in
+            h)
+                usage_helper "$0"
+                exit 0
+                ;;
+            v)
+                print_version
+                exit 0
+                ;;
+            f) histfile="${OPTARG}" ;;
+            :)
+                echo "Error: option -${OPTARG} requires an argument" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+            \?)
+                echo "Error: unknown option: -${OPTARG}" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    # 検索ワードは必須、かつ 1 つだけ
+    if [[ $# -eq 0 ]]; then
+        echo "Error: search word is missing" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+    local pattern="$1"
+    shift
+    if [[ $# -gt 0 ]]; then
+        echo "Error: unexpected argument: $1" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    if [[ -z "${histfile}" ]]; then
+        echo "Error: history file is not set (set HISTORYFILE or use -f)" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    local cmd
+    for cmd in grep awk; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            echo "Error: required command not found: ${cmd}" >&2
+            exit 1
+        fi
+    done
+
+    search_history "${pattern}" "${histfile}"
+}
+
+main "$@"
