@@ -1,0 +1,153 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-21
+# Script: sshcode
+# Description:
+#   Opens a directory on a remote SSH host as a VS Code workspace using the
+#   Remote-SSH extension (the 'vscode-remote://ssh-remote+...' URI scheme).
+#
+#   Steps:
+#     1. Parse command-line options (host, target directory).
+#     2. Resolve the remote user via 'ssh -G <host>' when a relative path
+#        is given so that '/home/<user>/<relative>' can be constructed.
+#     3. Launch 'code --folder-uri' pointing at the remote directory.
+#
+# Options:
+#   -s, --ssh HOST        Host name as defined in ~/.ssh/config (required)
+#   -r, --relative DIR    Directory relative to the remote user's home
+#   -a, --absolute DIR    Absolute directory path on the remote host
+#   -v, --version         Show version and exit
+#   -h, --help            Show this help message and exit
+#
+#   Exactly one of -r/--relative or -a/--absolute must be supplied.
+#
+# Usage:
+#   sshcode -s myhost -r projects/foo   # Open ~/projects/foo on 'myhost'
+#   sshcode -s myhost -a /srv/www       # Open /srv/www on 'myhost'
+#
+# Notes:
+#   - Requires the 'code' CLI and 'ssh', plus the VS Code Remote-SSH setup.
+#   - The relative form assumes the remote home is '/home/<user>'.
+#   - Sources '../../lib/docstring.sh' and '../../lib/version.sh'.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+source "${SCRIPT_DIR}/../../lib/version.sh"
+
+# ssh -G からリモートの user 名を解決する。
+# ssh -G は ~/.ssh/config と既定値をマージした設定を出力するので、
+# その中の 'user <name>' 行を拾う。
+resolve_remote_user() {
+    local host="$1"
+    local user
+
+    # 'user ' で始まる最初の行から値を取り出す。grep がマッチしないと
+    # exit 1 を返すが、その場合は user 未解決として扱いたいので
+    # set -e に巻き込まれないよう包む。
+    user="$({ ssh -G "${host}" || true; } | awk '/^user / { print $2; exit }')"
+
+    if [[ -z "${user}" ]]; then
+        echo "Error: could not resolve remote user for host: ${host}" >&2
+        exit 1
+    fi
+    printf '%s' "${user}"
+}
+
+# メイン処理
+main() {
+    local ssh_config=""
+    local relative_target=""
+    local absolute_target=""
+
+    # 長いオプションを短いオプションに変換
+    local args=()
+    for arg in "$@"; do
+        case "${arg}" in
+            --help)     args+=("-h") ;;
+            --version)  args+=("-v") ;;
+            --ssh)      args+=("-s") ;;
+            --relative) args+=("-r") ;;
+            --absolute) args+=("-a") ;;
+            *)          args+=("${arg}") ;;
+        esac
+    done
+
+    OPTIND=1
+    while getopts ":hvs:r:a:" opt "${args[@]}"; do
+        case "${opt}" in
+            h)
+                usage_helper "$0"
+                exit 0
+                ;;
+            v)
+                print_version
+                exit 0
+                ;;
+            s) ssh_config="${OPTARG}" ;;
+            r) relative_target="${OPTARG}" ;;
+            a) absolute_target="${OPTARG}" ;;
+            :)
+                echo "Error: option -${OPTARG} requires an argument" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+            \?)
+                echo "Error: unknown option: -${OPTARG}" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    if [[ $# -gt 0 ]]; then
+        echo "Error: unexpected argument: $1" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    # -s は必須
+    if [[ -z "${ssh_config}" ]]; then
+        echo "Error: SSH host is required (-s|--ssh)" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    # -r と -a はどちらか一方だけ
+    if [[ -n "${relative_target}" && -n "${absolute_target}" ]]; then
+        echo "Error: -r/--relative and -a/--absolute are mutually exclusive" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+    if [[ -z "${relative_target}" && -z "${absolute_target}" ]]; then
+        echo "Error: a target directory is required (-r|--relative or -a|--absolute)" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    local cmd
+    for cmd in code ssh; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            echo "Error: required command not found: ${cmd}" >&2
+            exit 1
+        fi
+    done
+
+    # ターゲットディレクトリを確定する。
+    local target_directory
+    if [[ -n "${absolute_target}" ]]; then
+        target_directory="${absolute_target}"
+    else
+        local user_root
+        user_root="$(resolve_remote_user "${ssh_config}")"
+        target_directory="/home/${user_root}/${relative_target}/"
+    fi
+
+    code --folder-uri "vscode-remote://ssh-remote+${ssh_config}${target_directory}"
+}
+
+main "$@"
