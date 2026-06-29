@@ -6,24 +6,26 @@
 # Description:
 #   Fetch the current global (public) IP address. By default the full
 #   response from ifconfig.co is returned as JSON (pretty-printed via 'jq'
-#   when available). With --v4 the script returns only the plain IPv4
-#   address from inet-ip.info.
+#   when available). With --v4 or --v6 the script returns only the plain
+#   IPv4 or IPv6 address from inet-ip.info.
 #
 #   Steps:
-#     1. Parse options (--v4, -t/--timeout, -h).
+#     1. Parse options (--v4, --v6, -t/--timeout, -h).
 #     2. Verify 'curl' is available; in JSON mode warn (and degrade to raw
 #        output) when 'jq' is missing.
 #     3. Query the appropriate endpoint with a curl timeout.
-#     4. Print the result (pretty JSON, raw JSON, or plain IPv4).
+#     4. Print the result (pretty JSON, raw JSON, plain IPv4, or plain IPv6).
 #
 # Options:
-#   --v4                 Use IPv4 only (queries inet-ip.info).
+#   --v4                 Use IPv4 only (queries inet-ip.info via -4).
+#   --v6                 Use IPv6 only (queries inet-ip.info via -6).
 #   -t, --timeout SEC    curl timeout in seconds (default: 5).
 #   -h, --help           Show this help message.
 #
 # Usage:
 #   fetch-globalip            # Full JSON from ifconfig.co
 #   fetch-globalip --v4       # Plain IPv4 from inet-ip.info
+#   fetch-globalip --v6       # Plain IPv6 from inet-ip.info
 #   fetch-globalip -t 10      # JSON with a 10-second timeout
 #
 # Exit Codes:
@@ -44,6 +46,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
 
 # ---- Default values ----
 USE_V4=false
+USE_V6=false
 TIMEOUT="5"
 
 # ---- Parse options ----
@@ -51,6 +54,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
   --v4)
     USE_V4=true
+    shift
+    ;;
+  --v6)
+    USE_V6=true
     shift
     ;;
   -t | --timeout)
@@ -91,6 +98,13 @@ if [[ "${USE_V4}" == true ]]; then
   echo "Using inet-ip.info..." >&2
   if ! IP=$(curl -4 --fail --silent --show-error --max-time "${TIMEOUT}" inet-ip.info); then
     echo "Error: failed to fetch IPv4 address." >&2
+    exit 1
+  fi
+  echo "${IP}"
+elif [[ "${USE_V6}" == true ]]; then
+  echo "Using inet-ip.info..." >&2
+  if ! IP=$(curl -6 --fail --silent --show-error --max-time "${TIMEOUT}" inet-ip.info); then
+    echo "Error: failed to fetch IPv6 address." >&2
     exit 1
   fi
   echo "${IP}"
