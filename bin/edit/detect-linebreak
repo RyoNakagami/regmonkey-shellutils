@@ -1,0 +1,144 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-29
+# Script: detect-linebreak
+# Description:
+#   Analyze line-ending usage in a file and report statistics or filter
+#   lines by ending type (LF, CR, or CRLF).
+#
+#   Steps:
+#     1. Parse command-line options.
+#     2. Validate the file argument (present, readable).
+#     3. Check that 'perl' is available.
+#     4. In CHECK mode (-c): count each ending type and print a summary.
+#     5. In filter mode (-l/-r/-w): print matching lines with line numbers.
+#
+# Options:
+#   -c             Show line-ending usage statistics (default)
+#   -l             Show lines with LF endings only
+#   -r             Show lines with CR endings only
+#   -w             Show lines with CRLF endings only
+#   -v, --version  Show version and exit
+#   -h, --help     Show this help message and exit
+#
+# Usage:
+#   detect-linebreak file.txt
+#   detect-linebreak -c file.txt
+#   detect-linebreak -w file.txt
+#   detect-linebreak -l file.txt
+#
+# Notes:
+#   - Requires 'perl'.
+#   - Sources '../../lib/docstring.sh' and '../../lib/version.sh'.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+source "${SCRIPT_DIR}/../../lib/version.sh"
+
+main() {
+    local mode="CHECK"
+    local file=""
+
+    # Expand long options to short equivalents
+    local args=()
+    local arg
+    for arg in "$@"; do
+        case "${arg}" in
+            --help)    args+=("-h") ;;
+            --version) args+=("-v") ;;
+            *)         args+=("${arg}") ;;
+        esac
+    done
+    set -- "${args[@]+"${args[@]}"}"
+
+    OPTIND=1
+    while getopts ":hvclrw" opt; do
+        case "${opt}" in
+            h)
+                usage_helper "$0"
+                exit 0
+                ;;
+            v)
+                print_version
+                exit 0
+                ;;
+            c) mode="CHECK" ;;
+            l) mode="LF" ;;
+            r) mode="CR" ;;
+            w) mode="CRLF" ;;
+            \?)
+                echo "Error: unknown option: -${OPTARG}" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    if [[ $# -eq 0 ]]; then
+        echo "Error: no input file specified." >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+    file="$1"
+    shift
+
+    if [[ $# -gt 0 ]]; then
+        echo "Error: unexpected argument: $1" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    if [[ ! -f "${file}" ]]; then
+        echo "Error: file not found: ${file}" >&2
+        exit 1
+    fi
+
+    if ! command -v perl >/dev/null 2>&1; then
+        echo "Error: required command not found: perl" >&2
+        exit 1
+    fi
+
+    if [[ "${mode}" == "CHECK" ]]; then
+        perl -e '
+            use strict;
+            use warnings;
+            my ($crlf, $cr, $lf, $total) = (0, 0, 0, 0);
+            while (<>) {
+                $total++;
+                if    (/\r\n$/) { $crlf++ }
+                elsif (/\r$/)   { $cr++   }
+                elsif (/\n$/)   { $lf++   }
+            }
+            printf "Line break usage:\n";
+            if ($total > 0) {
+                printf "  CRLF: %5d lines (%.2f%%)\n", $crlf, 100 * $crlf / $total;
+                printf "  CR:   %5d lines (%.2f%%)\n", $cr,   100 * $cr   / $total;
+                printf "  LF:   %5d lines (%.2f%%)\n", $lf,   100 * $lf   / $total;
+            }
+            printf "  Total lines: %d\n", $total;
+        ' "${file}"
+    else
+        perl -e '
+            use strict;
+            use warnings;
+            my $mode    = $ARGV[0];
+            my $file    = $ARGV[1];
+            my $line_no = 0;
+            open(my $fh, "<:raw", $file) or die "Cannot open $file: $!";
+            while (<$fh>) {
+                $line_no++;
+                if    (/\r\n$/ && $mode eq "CRLF") { printf "Line %-4d: CRLF => %s", $line_no, $_ }
+                elsif (/\r$/   && $mode eq "CR")   { printf "Line %-4d: CR   => %s", $line_no, $_ }
+                elsif (/\n$/   && $mode eq "LF")   { printf "Line %-4d: LF   => %s", $line_no, $_ }
+            }
+            close($fh);
+        ' "${mode}" "${file}"
+    fi
+}
+
+main "$@"
