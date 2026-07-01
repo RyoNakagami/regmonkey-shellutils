@@ -1,0 +1,191 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-07-01
+# Script: multiclamscan
+# Description:
+#   Scan the top-level files of a directory with ClamAV in parallel and
+#   record the results to a timestamped log file.
+#
+#   Steps:
+#     1. Parse command-line options and validate them.
+#     2. Resolve the scan directory and prepare the log directory/file.
+#     3. Enumerate top-level regular files (mindepth/maxdepth 1).
+#     4. Run clamscan across those files with xargs -P <threads>.
+#     5. Report the log location and a clean/infected verdict.
+#
+# Options:
+#   -d <directory>    Directory to scan (required)
+#   -p <threads>      Number of parallel threads (positive integer, default: 8)
+#   -m <max_filesize> Max file size passed to clamscan --max-filesize
+#                     (clamav size format, e.g. 100M; default: 100M)
+#   -v                Verbose: show all scanned files, not only infected
+#   -V, --version     Show version and exit
+#   -h, --help        Show this help message and exit
+#
+# Usage:
+#   multiclamscan -d ~/Downloads
+#   multiclamscan -d /data -p 16 -m 500M -v
+#   sudo multiclamscan -d /var/spool        # elevate for root-owned files
+#
+# Output:
+#   Log is saved to ${MULTICLAMSCAN_LOG_DIR:-~/Documents/clamav_log}/
+#   multiclamscan_<timestamp>.log
+#
+# Notes:
+#   - Requires clamav (clamscan), find and xargs.
+#   - Scans run as the invoking user; clamscan only needs read access to the
+#     target files. To scan files you cannot read, run the whole script under
+#     sudo rather than elevating each file individually.
+#   - clamscan exits 1 when a file is infected; this is expected and does not
+#     abort the run. The infected/clean verdict is reported from the log.
+#   - Sources '../../lib/docstring.sh' and '../../lib/version.sh'.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+source "${SCRIPT_DIR}/../../lib/version.sh"
+
+# ---- Default values ----
+THREADS=8
+MAX_FILESIZE=100M
+VERBOSE=false
+SCAN_DIR=""
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage_helper "$0"
+            exit 0
+            ;;
+        -V|--version)
+            print_version
+            exit 0
+            ;;
+        -d)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: -d requires an argument" >&2
+                exit 1
+            fi
+            SCAN_DIR="$2"
+            shift 2
+            ;;
+        -p)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: -p requires an argument" >&2
+                exit 1
+            fi
+            THREADS="$2"
+            shift 2
+            ;;
+        -m)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: -m requires an argument" >&2
+                exit 1
+            fi
+            MAX_FILESIZE="$2"
+            shift 2
+            ;;
+        -v)
+            VERBOSE=true
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            echo "Use --help for usage information." >&2
+            exit 1
+            ;;
+        *)
+            echo "Error: unexpected argument: $1" >&2
+            echo "Use --help for usage information." >&2
+            exit 1
+            ;;
+    esac
+done
+
+# ---- Validate ----
+if ! command -v clamscan >/dev/null 2>&1; then
+    echo "Error: clamscan not found (install clamav)" >&2
+    exit 1
+fi
+
+if [[ -z "${SCAN_DIR}" ]]; then
+    echo "Error: -d <directory> is required" >&2
+    echo "Use --help for usage information." >&2
+    exit 1
+fi
+
+if [[ ! "${THREADS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: -p must be a positive integer: ${THREADS}" >&2
+    exit 1
+fi
+
+if [[ ! "${MAX_FILESIZE}" =~ ^[0-9]+[KMG]?$ ]]; then
+    echo "Error: -m must be a size like 100M (digits + optional K/M/G): ${MAX_FILESIZE}" >&2
+    exit 1
+fi
+
+SCAN_DIR="$(realpath "${SCAN_DIR}")"
+
+if [[ ! -d "${SCAN_DIR}" ]]; then
+    echo "Error: directory not found: ${SCAN_DIR}" >&2
+    exit 1
+fi
+
+# ---- Prepare log ----
+LOG_DIR="${MULTICLAMSCAN_LOG_DIR:-${HOME}/Documents/clamav_log}"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/multiclamscan_$(date +%Y%m%d_%H%M%S).log"
+
+{
+    echo "========================================"
+    echo "ClamAV Multi-Scan Log"
+    echo "Directory: ${SCAN_DIR}"
+    echo "Date: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "========================================"
+    echo ""
+} >> "${LOG_FILE}"
+
+CLAM_OPTS=(--no-summary "--max-filesize=${MAX_FILESIZE}")
+if ! "${VERBOSE}"; then
+    CLAM_OPTS+=(--quiet -i)
+fi
+
+# ---- Run ----
+# clamscan exits 1 when a file is infected, so xargs returns non-zero on a
+# legitimate detection (xargs uses 123 when a command exits 1-125). Capture
+# the status explicitly instead of letting 'set -euo pipefail' abort the run
+# before we can report, then derive the verdict from the log itself, which is
+# robust to how many files xargs batched.
+scan_status=0
+find "${SCAN_DIR}" -mindepth 1 -maxdepth 1 -type f -print0 \
+    | xargs -0 -r -P "${THREADS}" -I {} clamscan "${CLAM_OPTS[@]}" {} \
+        >> "${LOG_FILE}" 2>&1 || scan_status=$?
+
+echo "Scan complete. Log saved to ${LOG_FILE}"
+
+# clamscan marks infected files with a trailing 'FOUND' in its output.
+if grep -q 'FOUND$' "${LOG_FILE}"; then
+    echo "Result: INFECTED files detected. See ${LOG_FILE}" >&2
+    exit 1
+fi
+
+# No detections: exit 0 for xargs success (0) or its "some command failed"
+# codes (123/124/125, which here mean clamscan exited 1 on files that turned
+# out clean per the log). Anything else is a genuine execution error.
+case "${scan_status}" in
+    0|123|124|125)
+        echo "Result: no infected files found."
+        ;;
+    *)
+        echo "Result: clamscan reported an error (exit ${scan_status}). See ${LOG_FILE}" >&2
+        exit "${scan_status}"
+        ;;
+esac
