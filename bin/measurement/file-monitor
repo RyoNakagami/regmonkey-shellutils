@@ -1,0 +1,132 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-07-01
+# Script: file-monitor
+# Description:
+#   Monitors a target file for changes in line count and size,
+#   logging results at regular intervals to a CSV log file.
+#
+#   Steps:
+#     1. Parse command-line options (target file, log file, interval,
+#        duration or end time, size unit).
+#     2. Validate required arguments and input file existence.
+#     3. Validate interval and unit values.
+#     4. Initialize the log file with a CSV header if empty or new.
+#     5. Monitor the file until the end time, appending a row each interval.
+#
+# Options:
+#    -f <file>           Specify the target file to monitor (required).
+#    -o <file>           Specify the log file to write results (required).
+#    -n <seconds>        Interval between checks in seconds (default: 1).
+#    -e <YYYY-MM-DD HH:MM>  End time; monitoring stops at this time.
+#    -t <seconds>        Duration in seconds; takes precedence over -e.
+#    -b <unit>           Size unit: B, KB, MB, or GB (default: B).
+#    -h                  Show this help message.
+#
+# Usage:
+#   ./file-monitor -f target.txt -o log.csv
+#   ./file-monitor -f target.txt -o log.csv -n 2 -t 60 -b KB
+#   ./file-monitor -f target.txt -o log.csv -e '2026-07-02 09:00'
+#
+# Notes:
+#   - Requires `wc`, `stat`, `awk`, and GNU `date`.
+#   - -t and -e are mutually exclusive; -t takes precedence.
+#   - If neither -t nor -e is given, monitoring runs until 23:59 today.
+#   - Sources '../../lib/docstring.sh' for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+TARGET_FILE=""
+LOG_FILE=""
+INTERVAL=1
+DURATION=""
+END_YYYYMMDD_HHMM=""
+UNIT="B"
+
+# ---- Parse options ----
+while getopts ":f:o:n:e:t:b:h" opt; do
+  case $opt in
+    f) TARGET_FILE="$OPTARG" ;;
+    o) LOG_FILE="$OPTARG" ;;
+    n) INTERVAL="$OPTARG" ;;
+    e) END_YYYYMMDD_HHMM="$OPTARG" ;;
+    t) DURATION="$OPTARG" ;;
+    b) UNIT="$OPTARG" ;;
+    h) usage_helper; exit 0 ;;
+    \?) echo "Error: unknown option: -$OPTARG" >&2; usage_helper; exit 1 ;;
+    :)  echo "Error: option -$OPTARG requires an argument" >&2; usage_helper; exit 1 ;;
+  esac
+done
+
+# ---- Validate required arguments ----
+if [[ -z "$TARGET_FILE" ]]; then
+    echo "Error: -f TARGET_FILE is required." >&2
+    exit 1
+fi
+if [[ -z "$LOG_FILE" ]]; then
+    echo "Error: -o LOG_FILE is required." >&2
+    exit 1
+fi
+
+# ---- Validate target file existence ----
+if [[ ! -f "$TARGET_FILE" ]]; then
+    echo "Error: TARGET_FILE does not exist: $TARGET_FILE" >&2
+    exit 1
+fi
+
+# ---- Validate interval is a positive integer ----
+if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || (( INTERVAL < 1 )); then
+    echo "Error: -n INTERVAL must be a positive integer, got: $INTERVAL" >&2
+    exit 1
+fi
+
+# ---- Validate size unit ----
+case "$UNIT" in
+    B|KB|MB|GB) ;;
+    *) echo "Error: -b UNIT must be one of B, KB, MB, GB; got: $UNIT" >&2; exit 1 ;;
+esac
+
+# ---- Validate duration if given ----
+if [[ -n "$DURATION" ]]; then
+    if ! [[ "$DURATION" =~ ^[0-9]+$ ]] || (( DURATION < 1 )); then
+        echo "Error: -t DURATION must be a positive integer, got: $DURATION" >&2
+        exit 1
+    fi
+fi
+
+# ---- Initialize log file with CSV header ----
+if [[ ! -f "$LOG_FILE" ]] || [[ ! -s "$LOG_FILE" ]]; then
+    echo "timestamp,lines,size_${UNIT}" > "$LOG_FILE"
+fi
+
+# ---- Determine end time (epoch seconds) ----
+if [[ -n "$DURATION" ]]; then
+    END_TIME=$(( $(date +%s) + DURATION ))
+elif [[ -n "$END_YYYYMMDD_HHMM" ]]; then
+    END_TIME=$(date -d "$END_YYYYMMDD_HHMM" +%s)
+else
+    END_TIME=$(date -d "$(date +%F) 23:59" +%s)
+fi
+
+# ---- Monitor loop ----
+while (( $(date +%s) < END_TIME )); do
+    LINE_COUNT=$(wc -l < "$TARGET_FILE")
+    RAW_SIZE=$(stat -c%s "$TARGET_FILE")
+
+    case "$UNIT" in
+        KB) FILE_SIZE=$(awk "BEGIN{printf \"%.2f\", $RAW_SIZE/1024}") ;;
+        MB) FILE_SIZE=$(awk "BEGIN{printf \"%.2f\", $RAW_SIZE/1024/1024}") ;;
+        GB) FILE_SIZE=$(awk "BEGIN{printf \"%.2f\", $RAW_SIZE/1024/1024/1024}") ;;
+        *)  FILE_SIZE="$RAW_SIZE" ;;
+    esac
+
+    echo "$(date +"%Y-%m-%d %H:%M:%S"),$LINE_COUNT,$FILE_SIZE" >> "$LOG_FILE"
+    sleep "$INTERVAL"
+done
