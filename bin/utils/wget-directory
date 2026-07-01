@@ -1,0 +1,133 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-07-01
+# Script: wget-directory
+# Description:
+#   Recursively download a website directory with wget, staying under the
+#   given URL (no parent traversal) and ignoring robots.txt.
+#
+#   Steps:
+#     1. Parse command-line options and the target URL.
+#     2. Validate the URL (present) and depth (positive integer).
+#     3. Check that 'wget' is available.
+#     4. Build the wget argument list (depth, include/exclude filters).
+#     5. Execute wget against the target URL.
+#
+# Options:
+#   -d URL         Target URL (may also be given as a positional argument)
+#   -l DEPTH       Maximum recursion depth (positive integer, default: 5)
+#   -i PATTERN     Include only files matching PATTERN (wget -A, e.g. 'pdf')
+#   -e PATTERN     Exclude files matching PATTERN (wget -R)
+#   -v, --version  Show version and exit
+#   -h, --help     Show this help message and exit
+#
+# Usage:
+#   wget-directory https://www.example.com/~user/
+#   wget-directory -d https://www.example.com/~user/ -i pdf -l 30
+#   wget-directory -e 'zip,tar.gz' https://www.example.com/files/
+#
+# Notes:
+#   - Requires 'wget'.
+#   - Include/exclude PATTERN is a wget accept/reject list; comma-separate
+#     multiple suffixes (e.g. 'pdf,ps,djvu').
+#   - Sources '../../lib/docstring.sh' and '../../lib/version.sh'.
+# Reference:
+#   https://stackoverflow.com/questions/273743/using-wget-to-recursively-fetch-a-directory-with-arbitrary-files-in-it
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+source "${SCRIPT_DIR}/../../lib/version.sh"
+
+main() {
+    local target=""
+    local maxdepth=5
+    local include=""
+    local exclude=""
+
+    # Expand long options to short equivalents.
+    local args=()
+    local arg
+    for arg in "$@"; do
+        case "${arg}" in
+            --help)    args+=("-h") ;;
+            --version) args+=("-v") ;;
+            *)         args+=("${arg}") ;;
+        esac
+    done
+    set -- "${args[@]+"${args[@]}"}"
+
+    OPTIND=1
+    while getopts ":d:l:e:i:hv" opt; do
+        case "${opt}" in
+            h)
+                usage_helper "$0"
+                exit 0
+                ;;
+            v)
+                print_version
+                exit 0
+                ;;
+            d) target="${OPTARG}" ;;
+            l) maxdepth="${OPTARG}" ;;
+            e) exclude="${OPTARG}" ;;
+            i) include="${OPTARG}" ;;
+            :)
+                echo "Error: option -${OPTARG} requires an argument." >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+            \?)
+                echo "Error: unknown option: -${OPTARG}" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    # Allow the target URL as a positional argument when -d was not used.
+    if [[ -z "${target}" && $# -gt 0 ]]; then
+        target="$1"
+        shift
+    fi
+
+    if [[ $# -gt 0 ]]; then
+        echo "Error: unexpected argument: $1" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    if [[ -z "${target}" ]]; then
+        echo "Error: no target URL specified (use -d URL or a positional URL)." >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    if ! [[ "${maxdepth}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: -l depth must be a positive integer: ${maxdepth}" >&2
+        exit 1
+    fi
+
+    if ! command -v wget >/dev/null 2>&1; then
+        echo "Error: required command not found: wget" >&2
+        exit 1
+    fi
+
+    # Build the wget argument list as an array so filters with special
+    # characters are passed as single, unsplit arguments.
+    local wget_args=(-e robots=off --recursive --no-parent -l "${maxdepth}")
+    if [[ -n "${exclude}" ]]; then
+        wget_args+=(-R "${exclude}")
+    fi
+    if [[ -n "${include}" ]]; then
+        wget_args+=(-A "${include}")
+    fi
+
+    wget "${wget_args[@]}" "${target}"
+}
+
+main "$@"
