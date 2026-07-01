@@ -1,0 +1,118 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-06-30
+# Script: mysshpass
+# Description:
+#   Run an SSH command with a password supplied via GPG-encrypted file or
+#   interactive prompt, using sshpass as the transport layer.
+#
+#   Steps:
+#     1. Parse command-line options (--host, -v/--version, -h/--help, --).
+#     2. Check required commands (sshpass; gpg when --host is given).
+#     3. If --host is given, decrypt SSHPASS_FILE and look up the password.
+#     4. Otherwise, prompt for the password interactively (no echo).
+#     5. Export SSHPASS and run sshpass -e with the remaining arguments.
+#
+# Options:
+#   --host HOST      Look up the password for HOST in SSHPASS_FILE.
+#                    When omitted, prompts for password interactively.
+#   -v, --version    Show version and exit.
+#   -h, --help       Show this help message and exit.
+#
+# Usage:
+#   mysshpass --host 192.168.1.10 ssh user@192.168.1.10
+#   mysshpass --host jump-server ssh -p 2222 user@jump-server
+#   mysshpass scp file.txt user@host:/remote/path/
+#
+# Notes:
+#   - SSHPASS_FILE env var sets the GPG-encrypted password file path.
+#     Defaults to ~/.ssh/sshpass.conf.gpg when unset.
+#   - Password file format (one entry per line):
+#       machine <hostname> password <password>
+#   - Requires sshpass and gpg to be installed.
+#   - Sources '../../lib/docstring.sh' and '../../lib/version.sh'.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+source "${SCRIPT_DIR}/../../lib/version.sh"
+
+# ---- Default values ----
+HOST=""
+SSHPASS_FILE="${SSHPASS_FILE:-${HOME}/.ssh/sshpass.conf.gpg}"
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage_helper "$0"
+      exit 0
+      ;;
+    -v|--version)
+      print_version
+      exit 0
+      ;;
+    --host)
+      if [[ -z "${2:-}" ]]; then
+        echo "Error: --host requires an argument" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+      fi
+      HOST="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Error: unknown option: $1" >&2
+      echo "Use --help for usage information." >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+# ---- Validate ----
+if ! command -v sshpass >/dev/null 2>&1; then
+  echo "Error: sshpass is not installed" >&2
+  exit 1
+fi
+
+if [[ -n "$HOST" ]]; then
+  if ! command -v gpg >/dev/null 2>&1; then
+    echo "Error: gpg is not installed" >&2
+    exit 1
+  fi
+  if [[ -z "${SSHPASS_FILE}" ]]; then
+    echo "Error: SSHPASS_FILE is not set" >&2
+    exit 1
+  fi
+  if [[ ! -f "$SSHPASS_FILE" ]]; then
+    echo "Error: password file not found: $SSHPASS_FILE" >&2
+    exit 1
+  fi
+fi
+
+# ---- Run ----
+if [[ -n "$HOST" ]]; then
+  SSHPASS="$(gpg --quiet --decrypt "$SSHPASS_FILE" 2>/dev/null \
+    | awk -v host="$HOST" '$1=="machine" && $2==host && $3=="password" {print $4; exit}')"
+  if [[ -z "$SSHPASS" ]]; then
+    echo "Error: no entry found for host: $HOST" >&2
+    exit 1
+  fi
+  export SSHPASS
+else
+  read -r -s -p "SSH password: " SSHPASS
+  echo ""
+  export SSHPASS
+fi
+
+sshpass -e "$@"
