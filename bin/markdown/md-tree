@@ -1,0 +1,239 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2025-11-20
+# Script: md-tree
+# Description:
+#   Generates a hierarchical tree of Markdown headings from a .md or .qmd file.
+#   Supports output in tree, JSON, or YAML format. Skips code blocks and
+#   YAML front matter for accurate heading extraction.
+#
+# Options:
+#    --tree      Output as tree (default)
+#    --json      Output as JSON
+#    --yaml      Output as YAML
+#    -h, --help  Show this help message
+#
+# Usage:
+#   ./md-tree [--tree|--json|--yaml] <file.md>
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---------------------------------------------------------------------------
+# parse_args: set $mode and $file from command-line arguments
+# ---------------------------------------------------------------------------
+parse_args() {
+    mode="tree"
+    file=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tree) mode="tree"; shift ;;
+            --json) mode="json";  shift ;;
+            --yaml) mode="yaml";  shift ;;
+            -h|--help) usage_helper; exit 0 ;;
+            -*)
+                echo "Error: unknown option $1" >&2
+                usage_helper
+                exit 1
+                ;;
+            *)
+                if [[ -n "$file" ]]; then
+                    echo "Error: multiple files not supported" >&2
+                    exit 1
+                fi
+                file="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# validate_file: check extension and readability
+# ---------------------------------------------------------------------------
+validate_file() {
+    local f="$1"
+
+    [[ -z "$f" ]] && return 0   # stdin モードは検証不要
+
+    case "$f" in
+        *.md|*.qmd) ;;
+        *)
+            echo "Error: Only .md or .qmd files are supported." >&2
+            exit 1
+            ;;
+    esac
+
+    [[ -f "$f" ]] || { echo "Error: File not found: $f" >&2;    exit 1; }
+    [[ -r "$f" ]] || { echo "Error: File not readable: $f" >&2; exit 1; }
+}
+
+# ---------------------------------------------------------------------------
+# run_gawk: single gawk process — parse headings, build tree, emit output.
+#
+#   Phases (all in one pass + END):
+#     1. SCAN   : skip front matter / fenced code blocks, collect headings
+#     2. BUILD  : construct parent-child relationships (END block)
+#     3. EMIT   : output tree / JSON / YAML (END block)
+#
+#   Design notes:
+#     - One gawk process avoids the fork + pipe overhead of a two-process pipeline.
+#     - Output helpers (print_tree / print_nested) are pure functions with no
+#       side-effects on global state, making them easy to test independently.
+#     - print_nested(parent, indent, fmt) unifies JSON and YAML rendering to
+#       eliminate the near-duplicate print_json_children / print_yaml_children.
+# ---------------------------------------------------------------------------
+run_gawk() {
+    local mode="$1"
+    local rootname="$2"
+    local file="${3:--}"   # デフォルト stdin
+
+    gawk -v MODE="$mode" -v ROOTNAME="$rootname" '
+
+    # ===========================================================
+    # Phase 1: SCAN — heading collection
+    # ===========================================================
+    BEGIN {
+        in_code    = 0
+        in_front   = 0
+        first_line = 1
+        count      = 0
+    }
+
+    {
+        line = $0
+
+        # --- YAML front matter ---
+        if (first_line && line ~ /^[[:space:]]*---[[:space:]]*$/) {
+            in_front   = 1
+            first_line = 0
+            next
+        }
+        first_line = 0
+
+        if (in_front) {
+            if (line ~ /^[[:space:]]*---[[:space:]]*$/) in_front = 0
+            next
+        }
+
+        # --- fenced code block toggle (``` or ~~~) ---
+        if (line ~ /^[[:space:]]*(```|~~~)/) { in_code = !in_code; next }
+        if (in_code) next
+
+        # --- ATX heading ---
+        if (match(line, /^[[:space:]]*(#+)[[:space:]]+(.*)$/, arr)) {
+            title = arr[2]
+            sub(/[[:space:]]+[#]+[[:space:]]*$/, "", title)   # trailing # を除去
+            sub(/[[:space:]]+$/,                 "", title)   # trailing spaces を除去
+            heading_level[++count] = length(arr[1])
+            heading_title[count]   = title
+        }
+    }
+
+    # ===========================================================
+    # Phase 2: BUILD — parent-child relationships
+    # ===========================================================
+    function build_relationships(    min_lvl, i, lvl, parent) {
+        min_lvl = 999
+        for (i = 1; i <= count; i++)
+            if (heading_level[i] < min_lvl) min_lvl = heading_level[i]
+
+        last_at[min_lvl - 1] = 0   # virtual root = node 0
+        for (i = 1; i <= count; i++) {
+            lvl    = heading_level[i]
+            parent = last_at[lvl - 1]
+            children[parent, ++child_count[parent]] = i
+            last_at[lvl] = i
+        }
+    }
+
+    # ===========================================================
+    # Phase 3: EMIT — output formatters
+    # ===========================================================
+
+    # --- tree format ---
+    function print_tree(parent,    i, n, idx, j, s) {
+        n = child_count[parent]
+        for (i = 1; i <= n; i++) {
+            idx = children[parent, i]
+            cont[heading_level[idx]] = (i < n) ? 1 : 0
+
+            s = ""
+            for (j = 1; j < heading_level[idx]; j++)
+                s = s (cont[j] ? "│   " : "    ")
+
+            print s ((i < n) ? "├── " : "└── ") heading_title[idx]
+            if (child_count[idx] > 0) print_tree(idx)
+        }
+    }
+
+    # --- JSON / YAML (unified renderer) ---
+    # fmt: "json" | "yaml"
+    function print_nested(parent, indent, fmt,    i, n, idx, pad, is_last) {
+        n = child_count[parent]
+        for (i = 1; i <= n; i++) {
+            idx     = children[parent, i]
+            is_last = (i == n)
+            pad     = sprintf("%" indent "s", "")
+
+            if (fmt == "json") {
+                printf "%s{\n",              pad
+                printf "%s  \"name\": \"%s\"", pad, heading_title[idx]
+                if (child_count[idx] > 0) {
+                    print ","
+                    printf "%s  \"children\": [\n", pad
+                    print_nested(idx, indent + 4, "json")
+                    printf "%s  ]\n", pad
+                } else {
+                    print ""
+                }
+                printf "%s}%s\n", pad, (is_last ? "" : ",")
+
+            } else {   # yaml
+                printf "%s- name: \"%s\"\n", pad, heading_title[idx]
+                if (child_count[idx] > 0) {
+                    printf "%s  children:\n", pad
+                    print_nested(idx, indent + 4, "yaml")
+                }
+            }
+        }
+    }
+
+    END {
+        build_relationships()
+
+        if (MODE == "tree" || MODE == "") {
+            print ROOTNAME
+            print_tree(0)
+
+        } else if (MODE == "json") {
+            print "{"
+            print "  \"name\": \"" ROOTNAME "\","
+            print "  \"children\": ["
+            print_nested(0, 4, "json")
+            print "  ]"
+            print "}"
+
+        } else if (MODE == "yaml") {
+            print "name: \"" ROOTNAME "\""
+            print "children:"
+            print_nested(0, 2, "yaml")
+        }
+    }
+    ' "$file"
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+main() {
+    parse_args "$@"
+    validate_file "$file"
+    run_gawk "$mode" "${file:-stdin}" "$file"
+}
+
+main "$@"
