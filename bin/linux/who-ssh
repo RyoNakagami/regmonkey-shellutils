@@ -1,0 +1,193 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-07-01
+# Script: who-ssh
+# Description:
+#   Display active SSH processes and optionally listening SSH ports.
+#   Output is paged through $PAGER (or less -R) when stdout is a tty.
+#   ANSI colours are suppressed automatically when stdout is not a tty
+#   or when the NO_COLOR environment variable is set.
+#
+#   Steps:
+#     1. Parse command-line options.
+#     2. Collect SSH process list via ps.
+#     3. If -p/--port is given, collect listening SSH ports via ss.
+#     4. Emit formatted output; page through $PAGER when stdout is a tty.
+#
+# Options:
+#   -p, --port      Show listening SSH port information (via ss).
+#   -d, --detail    Show detailed process info (CPU, MEM columns from ps aux).
+#   -u USER         Filter output to a specific user.
+#   -v, --version   Show version and exit.
+#   -h, --help      Show this help message and exit.
+#
+# Usage:
+#   who-ssh
+#   who-ssh -p
+#   who-ssh -d -u alice
+#   who-ssh | less -R
+#
+# Notes:
+#   - Requires ps (always) and ss (-p/--port mode only).
+#   - Set PAGER to override the default pager (less -R).
+#   - Set NO_COLOR=1 to disable colour output.
+#   - Sources '../../lib/docstring.sh' and '../../lib/version.sh'.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+source "${SCRIPT_DIR}/../../lib/version.sh"
+
+# ---- Colour setup ----
+# Colours are active only when stdout is a tty and NO_COLOR is unset/empty.
+_setup_colors() {
+    if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[1;33m'
+        CYAN='\033[0;36m'
+        NC='\033[0m'
+    else
+        RED='' GREEN='' YELLOW='' CYAN='' NC=''
+    fi
+}
+
+# ---- Default values ----
+SHOW_PORT=0
+SHOW_DETAIL=0
+USER_FILTER=""
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage_helper "$0"
+            exit 0
+            ;;
+        -v|--version)
+            print_version
+            exit 0
+            ;;
+        -p|--port)
+            SHOW_PORT=1
+            shift
+            ;;
+        -d|--detail)
+            SHOW_DETAIL=1
+            shift
+            ;;
+        -u)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: -u requires an argument" >&2
+                echo "Use --help for usage information." >&2
+                exit 1
+            fi
+            USER_FILTER="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            echo "Use --help for usage information." >&2
+            exit 1
+            ;;
+        *)
+            echo "Error: unexpected argument: $1" >&2
+            echo "Use --help for usage information." >&2
+            exit 1
+            ;;
+    esac
+done
+
+# ---- Helpers ----
+
+_print_header() {
+    if [[ $SHOW_DETAIL -eq 1 ]]; then
+        printf "${CYAN}%-15s %-8s %-6s %-6s %-50s${NC}\n" \
+            "USER" "PID" "%CPU" "%MEM" "COMMAND"
+        printf "%-15s %-8s %-6s %-6s %-50s\n" \
+            "---------------" "--------" "------" "------" \
+            "--------------------------------------------------"
+    else
+        printf "${CYAN}%-15s %-8s %-50s${NC}\n" "USER" "PID" "COMMAND"
+        printf "%-15s %-8s %-50s\n" \
+            "---------------" "--------" \
+            "--------------------------------------------------"
+    fi
+}
+
+_show_ports() {
+    printf "${YELLOW}Listening SSH ports:${NC}\n"
+    # ss -tlnp: TCP listen, numeric, show process; grep sshd entries
+    local result
+    result="$(ss -tlnp 2>/dev/null | grep sshd || true)"
+    if [[ -z "$result" ]]; then
+        printf "${RED}No SSH ports listening${NC}\n"
+    else
+        printf '%s\n' "$result"
+    fi
+    printf '\n'
+}
+
+_show_processes() {
+    printf "${YELLOW}Active SSH processes:${NC}\n"
+    _print_header
+
+    local filter="ssh"
+    [[ -n "$USER_FILTER" ]] && filter="${filter}.*${USER_FILTER}"
+
+    local found=0
+    if [[ $SHOW_DETAIL -eq 1 ]]; then
+        # ps aux: user pid %cpu %mem ... command(col11)
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            printf "%-15s %-8s %-6s %-6s %-50s\n" \
+                "$(awk '{print $1}' <<< "$line")" \
+                "$(awk '{print $2}' <<< "$line")" \
+                "$(awk '{print $3}' <<< "$line")" \
+                "$(awk '{print $4}' <<< "$line")" \
+                "$(awk '{print $11}' <<< "$line")"
+            found=1
+        done < <({ ps aux | grep -e "$filter" | grep -v grep || true; })
+    else
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            printf "%-15s %-8s %-50s\n" \
+                "$(awk '{print $1}' <<< "$line")" \
+                "$(awk '{print $2}' <<< "$line")" \
+                "$(awk '{for(i=3;i<=NF;i++) printf $i" "; print ""}' <<< "$line")"
+            found=1
+        done < <({ ps -eo user,pid,command | grep -e "$filter" | grep -v grep || true; })
+    fi
+
+    if [[ $found -eq 0 ]]; then
+        printf "${RED}No SSH processes found${NC}\n"
+    fi
+}
+
+# ---- Main ----
+main() {
+    _setup_colors
+
+    local output
+    output="$({
+        printf "${GREEN}SSH process report${NC}\n\n"
+        [[ $SHOW_PORT -eq 1 ]] && _show_ports
+        _show_processes
+    })"
+
+    # Page through $PAGER when stdout is a tty and a pager is available.
+    if [[ -t 1 ]] && command -v "${PAGER:-less}" >/dev/null 2>&1; then
+        printf '%s\n' "$output" | ${PAGER:-less -R}
+    else
+        printf '%s\n' "$output"
+    fi
+}
+
+main "$@"
