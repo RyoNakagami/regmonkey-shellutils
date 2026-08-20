@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-08-20
+# Script: ask-command
+# Description:
+#   任意の CLI コマンドの概要を「動作 / syntax / frequently used options /
+#   examples」の4節に絞って簡潔に解説させる。バックエンドに
+#   claude-stdin-prompt または codex-stdin-prompt を使用する。
+#
+#     ask-command git stash
+#     ask-command --model opus4.8 rsync
+#     ask-command --codex "docker compose up"
+#     ask-command -n 5 jq            # examples を5件に増やす
+#
+#   引数は連結して1つのコマンド文字列として扱われるため、
+#   'ask-command git stash' と 'ask-command "git stash"' は等価。
+#
+#   Steps:
+#     1. オプションを解析し、対象コマンド文字列を組み立てる。
+#     2. 4節構成を指示するプロンプトを生成する。
+#     3. バックエンド (claude|codex) にコマンド名を stdin として渡し実行する。
+#
+# Options:
+#   --codex                   codex-stdin-prompt を使用 (デフォルト: claude-stdin-prompt)
+#   --model, -m <model>       使用するモデル
+#                             claude 時のデフォルト: haiku
+#                             codex 時のデフォルト: gpt-5.6-luna
+#                             codex では短縮名も可: 'luna' / 'terra'
+#   --example, -n <number>    examples の件数 (デフォルト: 3)
+#   --lang, -l <lang>         出力言語 (デフォルト: ja)
+#   -h, --help                このヘルプを表示
+#   --                        以降をコマンド文字列として扱う (先頭が '-' のとき用)
+#
+# Usage:
+#   ask-command [options] COMMAND [ARGS...]
+#
+#   ask-command git stash
+#   ask-command --model opus4.8 git rebase
+#   ask-command --codex awk                 # codex + gpt-5.6-luna
+#   ask-command --codex --model terra awk   # 短縮名で terra を指定
+#   ask-command --lang en -n 5 find
+#   ask-command -- --version              # '--' で先頭 '-' を保護
+#
+# Notes:
+#   - 解説はモデルの知識に基づく生成物であり、手元の実装／バージョンとの
+#     差異がありうる。正確な仕様は 'man' や '--help' を参照すること。
+#   - デフォルトは claude + haiku（速度重視）。精度が要るときは
+#     --model opus4.8 等を指定する。
+#   - --codex 時は gpt-5.6-luna を明示指定する（~/.codex/config.toml の
+#     既定には依存しない）。ChatGPT アカウント認証では 'gpt-5' 系は
+#     利用できないため、gpt-5.6-* / gpt-5.5 / gpt-5.4-mini を使うこと。
+#   - Sources '../../lib/docstring.sh' for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+CLAUDE_DEFAULT_MODEL="haiku"
+CODEX_DEFAULT_MODEL="gpt-5.6-luna"
+USE_CODEX=false
+MODEL=""
+EXAMPLE=3
+LANG_OUT="ja"
+POSITIONAL=()
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage_helper
+            exit 0
+            ;;
+        --codex)
+            USE_CODEX=true
+            shift
+            ;;
+        --model|-m)
+            [[ $# -ge 2 ]] || { echo "Error: $1 requires an argument." >&2; exit 1; }
+            MODEL="$2"
+            shift 2
+            ;;
+        --model=*|-m=*)
+            MODEL="${1#*=}"
+            shift
+            ;;
+        --example|-n)
+            [[ $# -ge 2 ]] || { echo "Error: $1 requires an argument." >&2; exit 1; }
+            EXAMPLE="$2"
+            shift 2
+            ;;
+        --example=*|-n=*)
+            EXAMPLE="${1#*=}"
+            shift
+            ;;
+        --lang|-l)
+            [[ $# -ge 2 ]] || { echo "Error: $1 requires an argument." >&2; exit 1; }
+            LANG_OUT="$2"
+            shift 2
+            ;;
+        --lang=*|-l=*)
+            LANG_OUT="${1#*=}"
+            shift
+            ;;
+        --)
+            shift
+            POSITIONAL+=("$@")
+            break
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            POSITIONAL+=("$@")
+            break
+            ;;
+    esac
+done
+
+# ---- Validate --example ----
+[[ "${EXAMPLE}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Error: --example must be a positive integer, got: ${EXAMPLE}" >&2
+    exit 1
+}
+
+# ---- 対象コマンドの組み立て ----
+if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
+    echo "Error: 解説対象のコマンドが指定されていません" >&2
+    echo "Usage: $(basename "$0") [options] COMMAND [ARGS...]" >&2
+    exit 1
+fi
+
+TARGET="${POSITIONAL[*]}"
+
+if [[ -z "${TARGET// /}" ]]; then
+    echo "Error: 解説対象のコマンドが空です" >&2
+    exit 1
+fi
+
+# ---- プロンプト本文 ----
+PROMPT="あなたは熟練の UNIX/Linux エンジニアです。stdin で与えられたコマンドについて、
+以下の4節だけで簡潔に解説してください。出力言語は ${LANG_OUT} です。
+
+出力フォーマット（この4節構成と順序を厳守し、前置き・後書きは一切書かない）。
+節見出しは下記の意味を保ったまま ${LANG_OUT} に訳して使う（例: 英語なら
+'## Behavior' / '## Syntax' / '## Frequently Used Options' / '## Examples'）:
+
+## 動作
+そのコマンドが何をするかを2〜4文で説明する。何のために使うのか、
+実行すると何が起きるのかが分かるように書く。
+
+## Syntax
+\`\`\`
+<コマンドの構文を1〜3行で>
+\`\`\`
+必須引数・省略可能引数が分かる形で書く。
+
+## Frequently Used Options
+2列のMarkdownテーブル（1列目はオプション、2列目はその説明）で書く。
+テーブルのヘッダー行および本文はすべて ${LANG_OUT} で記述する。
+実務でよく使うものを5〜8個に絞る。マイナーなオプションは載せない。
+
+## Examples
+${EXAMPLE}件、実用的なワンライナーを挙げる。各例は次の形式:
+
+\`\`\`bash
+<コマンド>
+\`\`\`
+→ 何が起きるかの1行説明
+
+制約:
+- 冗長な説明・注意書き・免責は書かない。
+- 存在しないオプションを創作しない。確信が持てない場合はその節を短くする。
+- サブコマンド（例: 'git stash'）が与えられた場合は、その
+  サブコマンドに限定して解説し、親コマンド全体の解説はしない。"
+
+# ---- バックエンド選択 ----
+if ${USE_CODEX}; then
+    AGENT="$(dirname "${BASH_SOURCE[0]}")/codex-stdin-prompt"
+    # codex は config.toml の既定に任せず、luna を明示指定する。
+    if [[ -z "${MODEL}" ]]; then
+        MODEL="${CODEX_DEFAULT_MODEL}"
+    fi
+    # 短縮名を正式なスラッグへ解決する（'luna' -> 'gpt-5.6-luna'）。
+    case "${MODEL}" in
+        luna)  MODEL="gpt-5.6-luna" ;;
+        terra) MODEL="gpt-5.6-terra" ;;
+    esac
+else
+    AGENT="$(dirname "${BASH_SOURCE[0]}")/claude-stdin-prompt"
+    # claude 側のデフォルトは sonnet なので、速度重視で haiku に上書きする。
+    if [[ -z "${MODEL}" ]]; then
+        MODEL="${CLAUDE_DEFAULT_MODEL}"
+    fi
+fi
+
+[[ -x "${AGENT}" ]] || { echo "Error: agent not found or not executable: ${AGENT}" >&2; exit 1; }
+
+AGENT_ARGS=(-p "${PROMPT}")
+if [[ -n "${MODEL}" ]]; then
+    AGENT_ARGS+=(--model "${MODEL}")
+fi
+
+# ---- 呼び出し ----
+# バックエンドは stdin 必須なので、対象コマンド文字列を stdin として渡す。
+echo "${TARGET}" | "${AGENT}" "${AGENT_ARGS[@]}"

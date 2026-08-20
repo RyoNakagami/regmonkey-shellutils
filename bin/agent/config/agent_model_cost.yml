@@ -1,0 +1,147 @@
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-08-20
+# File: agent_model_cost.yml
+# Description:
+#   ls-agent-model が参照する、エージェント用モデルの単価テーブル。
+#   単位は provider の unit（既定 "USD / 1M tokens"）、モデル個別に違う場合は
+#   そのモデルの cost_type で上書きする。
+#
+#   各プロバイダは以下のキーを持つ:
+#     unit         : 単価の単位の既定値（例: USD / 1M tokens）。models 配下の
+#                    数値が何を表すのかを出力側で明示するために持たせる。
+#     source       : 価格表の出典 URL
+#     retrieved    : 価格を転記した日付 (YYYY-MM-DD)。この日時点の価格である
+#                    ことを ls-agent-model の JSON 出力に含める。
+#     pricing_tier : 適用される価格区分（例: standard）。Batch / Priority 等の
+#                    別区分の価格ではないことを明示するために使う。
+#     models       : slug をキーとする単価マップ
+#
+#   models.<slug> の値:
+#     display   : 価格表上の表示名（省略時は slug）
+#     cost_type : このモデルだけ単位が違う場合の上書き（省略時は provider の
+#                 unit を使う）。トークン以外の課金単位（画像枚数・リクエスト
+#                 数など）のモデルが混ざったときに使う。
+#     その他のキーは価格そのもの。ネスト構造は各プロバイダの価格表の形に
+#     合わせてよい（OpenAI は short/long context の2階層、Anthropic は
+#     input/output のフラット構造）。ls-agent-model は構造を解釈せず
+#     JSON としてそのまま返すため、プロバイダごとに形が違ってよい。
+#     価格表で '-' となっている項目は、そのキー自体を省略する。
+#
+# Notes:
+#   - このファイルは「価格の情報源」であり、「利用可能なモデルの情報源」では
+#     ない。利用可否は 'codex debug models --bundled' が決める。したがって
+#     ここには CLI に出てこないモデル（gpt-5.5-pro 等）が含まれてよく、
+#     逆に CLI にあって価格が未掲載のモデル（gpt-5.2 等）が欠けていてよい。
+#   - 価格は改定される。課金の根拠には必ず source の URL を参照すること。
+# -----------------------------------------------------------------------------
+
+openai:
+  unit: "USD / 1M tokens"
+  source: "https://developers.openai.com/api/docs/pricing"
+  retrieved: "2026-08-20"
+  pricing_tier: "standard"
+  models:
+    gpt-5.6-sol:
+      display: "GPT-5.6-Sol"
+      short:
+        input: 5.00
+        cached_input: 0.50
+        cache_write: 6.25
+        output: 30.00
+      long:
+        input: 10.00
+        cached_input: 1.00
+        cache_write: 12.50
+        output: 45.00
+
+    gpt-5.6-terra:
+      display: "GPT-5.6-Terra"
+      short:
+        input: 2.00
+        cached_input: 0.20
+        cache_write: 2.50
+        output: 12.00
+      long:
+        input: 4.00
+        cached_input: 0.40
+        cache_write: 5.00
+        output: 18.00
+
+    gpt-5.6-luna:
+      display: "GPT-5.6-Luna"
+      short:
+        input: 0.20
+        cached_input: 0.02
+        cache_write: 0.25
+        output: 1.20
+      long:
+        input: 0.40
+        cached_input: 0.04
+        cache_write: 0.50
+        output: 1.80
+
+    gpt-5.5:
+      display: "GPT-5.5"
+      short:
+        input: 5.00
+        cached_input: 0.50
+        output: 30.00
+      long:
+        input: 10.00
+        cached_input: 1.00
+        output: 45.00
+
+    gpt-5.5-pro:
+      display: "GPT-5.5-Pro"
+      short:
+        input: 30.00
+        output: 180.00
+      long:
+        input: 60.00
+        output: 270.00
+
+    gpt-5.4:
+      display: "GPT-5.4"
+      short:
+        input: 2.50
+        cached_input: 0.25
+        output: 15.00
+      long:
+        input: 5.00
+        cached_input: 0.50
+        output: 22.50
+
+    gpt-5.4-mini:
+      display: "GPT-5.4-Mini"
+      short:
+        input: 0.75
+        cached_input: 0.075
+        output: 4.50
+
+    gpt-5.4-nano:
+      display: "GPT-5.4-Nano"
+      short:
+        input: 0.20
+        cached_input: 0.02
+        output: 1.25
+
+    gpt-5.4-pro:
+      display: "GPT-5.4-Pro"
+      short:
+        input: 30.00
+        output: 180.00
+      long:
+        input: 60.00
+        output: 270.00
+
+# --claude 用のプレースホルダ。ls-agent-model の --claude は未実装のため、
+# 現状 models は参照されない。Anthropic の価格表は OpenAI と形が違い
+# （short/long context の区別が無く、cache write の単価も列としては公開
+# されていない）、models は input/output のフラットな構造になる見込み。
+anthropic:
+  unit: "USD / 1M tokens"
+  source: "https://platform.claude.com/docs/en/pricing"
+  retrieved: null
+  pricing_tier: "standard"
+  models: {}

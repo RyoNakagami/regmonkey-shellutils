@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-08-20
+# Script: ls-agent-model
+# Description:
+#   コーディングエージェントで利用可能なモデルの一覧を表示する．デフォルトは
+#   codex CLI が報告するモデルの slug のみを1行1件で出力し，--json を付けると
+#   config/agent_model_cost.yml の token 単価を結合した JSON を出力する
+#   （単位は各モデルの cost_type フィールドに入る）．
+#
+#     ls-agent-model              # slug のみ
+#     ls-agent-model --json       # slug + 単価 + 価格メタ情報 (JSON)
+#     ls-agent-model -a           # hide 扱いのモデルも含める
+#
+#   Steps:
+#     1. オプションを解析し，対象プロバイダ (codex|claude) を決める．
+#     2. 'codex debug models --bundled' から利用可能な slug を取得する．
+#     3. --json 指定時は config/agent_model_cost.yml の単価を slug で結合し，
+#        価格区分・取得日・出典とあわせて JSON で出力する．
+#
+# Options:
+#   -a, --all         codex が 'hide' 扱いにしているモデルも一覧に含める
+#   -j, --json        単価と価格メタ情報 (tier / 取得日 / 出典) を含む
+#                     JSON を出力する
+#   --claude          Claude のモデルを対象にする (未実装)
+#   -v, --version     バージョンを表示して終了
+#   -h, --help        このヘルプを表示して終了
+#
+# Usage:
+#   ls-agent-model [options]
+#
+#   ls-agent-model                # 利用可能な slug を列挙
+#   ls-agent-model --json         # 単価付き JSON
+#   ls-agent-model -aj            # hide 込みで単価付き JSON
+#
+#   # jq で任意の形に整形する（表示整形はこのスクリプトでは行わない）
+#   ls-agent-model --json | jq -r '.models[] | [.slug, .price.short.input] | @tsv'
+#
+# Notes:
+#   - Requires 'codex', 'yamlcli', 'jq'.
+#   - 「利用可能なモデル」の情報源は codex CLI，「単価」の情報源は
+#     config/agent_model_cost.yml であり，両者は slug で結合される．
+#     このため CLI が返すのに単価が未掲載のモデルは price が空になり，
+#     単価表にあるが CLI が返さないモデルは一覧に現れない．
+#   - price のネスト構造は config の記述をそのまま返す．プロバイダごとに
+#     価格表の形が違う（OpenAI は short/long context の2階層，Anthropic は
+#     input/output のフラット構造）ため，構造は解釈も正規化もしない．
+#   - 単価の単位は各モデルの cost_type に入れる（例 "USD / 1M tokens"）．
+#     config のモデルに cost_type があればそれを，無ければ provider の
+#     unit を使う．解決済みの値が入るので利用側での分岐は不要．
+#   - JSON にはこのほか価格区分 (pricing_tier)，価格を転記した日付
+#     (retrieved)，出典 URL (source) を含める．いずれも config の値をその
+#     まま出す．価格は改定されるため，課金の根拠には必ず出典 URL を参照
+#     すること．
+#   - --claude は将来対応予定で，現状は指定するとエラー終了する．
+#   - The config file is resolved relative to this script
+#     (config/agent_model_cost.yml)．CONFIG_FILE 環境変数で上書き可能．
+#   - Sources '../../lib/docstring.sh' and '../../lib/version.sh'.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../lib/docstring.sh
+source "${SCRIPT_DIR}/../../lib/docstring.sh"
+# shellcheck source=../../lib/version.sh
+source "${SCRIPT_DIR}/../../lib/version.sh"
+
+# config/agent_model_cost.yml はこのスクリプトからの相対で解決する．
+# CONFIG_FILE / CODEX_BIN はテストから差し替えるための seam．
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/config/agent_model_cost.yml}"
+CODEX_BIN="${CODEX_BIN:-codex}"
+
+# 参照する config 上のプロバイダ．--claude 実装時に 'anthropic' へ切り替える．
+PROVIDER="openai"
+
+# codex が報告するモデルを {slug, display_name, visibility} の JSON 配列で返す．
+# 引数が 0 のときは visibility == "list" のものだけに絞る．
+fetch_codex_models() {
+    local include_hidden="$1"
+    "${CODEX_BIN}" debug models --bundled \
+        | jq --argjson all "${include_hidden}" '
+            [ .models[]
+              | select($all == 1 or .visibility == "list")
+              | {slug, display_name, visibility}
+            ]'
+}
+
+# プロバイダの価格メタ情報（source / retrieved / pricing_tier）を JSON で返す．
+provider_meta() {
+    local provider="$1"
+    yamlcli --to-json "${CONFIG_FILE}" \
+        | jq --arg p "${provider}" '
+            .[$p] // {}
+            | {
+                source:       .source,
+                retrieved:    .retrieved,
+                pricing_tier: .pricing_tier
+              }'
+}
+
+# codex の一覧に config の単価を slug で結合した JSON 配列を返す．
+# 単価が無いモデルも一覧からは落とさず，価格側を空オブジェクトのまま残す．
+join_cost() {
+    local provider="$1" models_json="$2"
+    # YAML の読み込みは1回で済ませ，models と unit をそこから取り出す．
+    local provider_json cost_json default_unit
+    provider_json="$(yamlcli --to-json "${CONFIG_FILE}" \
+        | jq --arg p "${provider}" '.[$p] // {}')"
+    cost_json="$(jq '.models // {}' <<< "${provider_json}")"
+    default_unit="$(jq -r '.unit // empty' <<< "${provider_json}")"
+    jq -n \
+        --argjson models "${models_json}" \
+        --argjson cost "${cost_json}" \
+        --arg unit "${default_unit}" '
+        [ $models[]
+          | . as $m
+          | ($cost[$m.slug] // {}) as $c
+          | {
+              slug:      $m.slug,
+              display:   ($c.display // $m.display_name // $m.slug),
+              # 単位はモデル個別の cost_type を優先し，無ければ provider の
+              # unit を使う．解決済みの値を入れるので利用側は分岐不要．
+              cost_type: ($c.cost_type // (if $unit == "" then null else $unit end)),
+              price:     ($c | del(.display, .cost_type))
+            }
+        ]'
+}
+
+main() {
+    local include_hidden=0 output_json=0 use_claude=0
+
+    # 長いオプションを短いオプションに変換する（--claude だけは別扱い）．
+    local args=() arg
+    for arg in "$@"; do
+        case "${arg}" in
+            --help)    args+=("-h") ;;
+            --version) args+=("-v") ;;
+            --all)     args+=("-a") ;;
+            --json)    args+=("-j") ;;
+            --claude)  use_claude=1 ;;
+            *)         args+=("${arg}") ;;
+        esac
+    done
+
+    # --claude を取り除いた後の引数列で改めて解析する（元の "$@" のままだと
+    # 後段の余剰引数チェックが --claude を拾ってしまう）．
+    set -- ${args[@]+"${args[@]}"}
+
+    OPTIND=1
+    if (( $# > 0 )); then
+        while getopts ":hvaj" opt "$@"; do
+            case "${opt}" in
+                h)
+                    usage_helper "$0"
+                    exit 0
+                    ;;
+                v)
+                    print_version
+                    exit 0
+                    ;;
+                a) include_hidden=1 ;;
+                j) output_json=1 ;;
+                \?)
+                    echo "Error: unknown option: -${OPTARG}" >&2
+                    echo "Use --help for usage information." >&2
+                    exit 1
+                    ;;
+            esac
+        done
+        shift $((OPTIND - 1))
+    fi
+
+    if [[ $# -gt 0 ]]; then
+        echo "Error: unexpected argument: $1" >&2
+        echo "Use --help for usage information." >&2
+        exit 1
+    fi
+
+    if (( use_claude )); then
+        echo "Error: --claude is not implemented yet." >&2
+        exit 1
+    fi
+
+    local cmd
+    for cmd in "${CODEX_BIN}" yamlcli jq; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            echo "Error: required command not found: ${cmd}" >&2
+            exit 1
+        fi
+    done
+
+    if [[ ! -r "${CONFIG_FILE}" ]]; then
+        echo "Error: cannot read config file: ${CONFIG_FILE}" >&2
+        exit 1
+    fi
+
+    local models
+    models="$(fetch_codex_models "${include_hidden}")"
+
+    if (( output_json )); then
+        # JSON では価格そのものに加え，どの時点のどの区分の価格かを示す
+        # メタ情報（pricing_tier / retrieved / source）も返す．
+        local joined meta
+        meta="$(provider_meta "${PROVIDER}")"
+        joined="$(join_cost "${PROVIDER}" "${models}")"
+        jq -n --sort-keys \
+            --argjson meta "${meta}" \
+            --argjson models "${joined}" \
+            '{
+                pricing_tier: $meta.pricing_tier,
+                retrieved:    $meta.retrieved,
+                source:       $meta.source,
+                models:       $models
+             }'
+    else
+        jq -r '.[].slug' <<< "${models}"
+    fi
+}
+
+main "$@"
