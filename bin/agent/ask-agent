@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-08-21
+# Script: ask-agent
+# Description:
+#   General-purpose 'ask' command that handles a natural-language request with
+#   the cheapest available model. Light requests such as translation,
+#   summarization, paraphrasing, or shortening are answered with the result
+#   text only, without any preamble. Uses claude-stdin-prompt or
+#   codex-stdin-prompt as the backend.
+#
+#     ask-agent into japanese how are you?
+#     ask-agent make it concise under 10 strings 今日は天気が良いですね御機嫌如何ですか
+#
+#   All arguments are concatenated into a single request string, so
+#   'ask-agent into japanese hello' and 'ask-agent "into japanese hello"' are
+#   equivalent. There is no need to separate the instruction from the target
+#   text; pass the whole thing as plain natural language.
+#
+#   Steps:
+#     1. Parse options and assemble the remaining arguments into a request.
+#     2. Build a system instruction that asks for the result text only.
+#     3. Pass the request to the backend (claude|codex) on stdin and run it.
+#
+# Options:
+#   --codex                   Use codex-stdin-prompt (default: claude-stdin-prompt)
+#   --model, -m <model>       Model to use
+#                             claude default: haiku (cheapest)
+#                             codex default: gpt-5.6-luna (cheapest)
+#                             codex also accepts short names: 'luna' / 'terra'
+#   --verbose, -v             Drop the brevity constraint and allow an answer
+#                             that includes explanation
+#   -h, --help                Show this help message
+#   --                        Treat everything after this as the request
+#                             (for requests starting with '-')
+#
+# Usage:
+#   ask-agent [options] REQUEST...
+#
+#   ask-agent into japanese how are you?
+#   ask-agent make it concise under 10 strings 今日は天気が良いですね
+#   ask-agent 次の英文を敬体に直して "we got your mail"
+#   ask-agent --model sonnet この段落を3行に要約して ...
+#   ask-agent --codex into english 承知しました
+#   ask-agent -- --force というオプションの意味を1行で
+#
+# Notes:
+#   - The default is the cheapest model (claude: haiku / codex: gpt-5.6-luna).
+#     It targets light work such as translation, summarization, and
+#     reformatting; for harder reasoning, select a stronger model with --model.
+#   - Output is the result text only: no preamble, no trailing remarks, no
+#     markdown decoration. Use --verbose when explanation is also wanted.
+#   - The output language is not specified. The model infers it from the
+#     request ('into japanese' means Japanese; with no instruction, the
+#     language of the input text).
+#   - With --codex, gpt-5.6-luna is passed explicitly (it does not rely on the
+#     default in ~/.codex/config.toml). ChatGPT account authentication cannot
+#     use the 'gpt-5' family, so use gpt-5.6-* / gpt-5.5 / gpt-5.4-mini.
+#   - Sources '../../lib/docstring.sh' for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+# 最安モデルを既定にする。Claude は Haiku 4.5 ($1/$5 per 1M tokens)、
+# codex は gpt-5.6-luna ($0.20/$1.20 per 1M tokens) がそれぞれ最安。
+CLAUDE_DEFAULT_MODEL="haiku"
+CODEX_DEFAULT_MODEL="gpt-5.6-luna"
+USE_CODEX=false
+MODEL=""
+VERBOSE=false
+POSITIONAL=()
+
+# ---- Parse options ----
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage_helper
+            exit 0
+            ;;
+        --codex)
+            USE_CODEX=true
+            shift
+            ;;
+        --verbose|-v)
+            VERBOSE=true
+            shift
+            ;;
+        --model|-m)
+            [[ $# -ge 2 ]] || { echo "Error: $1 requires an argument." >&2; exit 1; }
+            MODEL="$2"
+            shift 2
+            ;;
+        --model=*|-m=*)
+            MODEL="${1#*=}"
+            shift
+            ;;
+        --)
+            shift
+            POSITIONAL+=("$@")
+            break
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            POSITIONAL+=("$@")
+            break
+            ;;
+    esac
+done
+
+# ---- 依頼文の組み立て ----
+if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
+    echo "Error: 依頼文が指定されていません" >&2
+    echo "Usage: $(basename "$0") [options] REQUEST..." >&2
+    exit 1
+fi
+
+REQUEST="${POSITIONAL[*]}"
+
+if [[ -z "${REQUEST// /}" ]]; then
+    echo "Error: 依頼文が空です" >&2
+    exit 1
+fi
+
+# ---- プロンプト本文 ----
+# stdin に依頼文が入る。指示と対象テキストが混在した自然文を、モデル側で
+# 「何をするか」と「何に対してするか」に切り分けさせる。
+PROMPT="stdin には、ユーザーからの自然文の依頼が入っています。
+依頼は「何をしてほしいか（指示）」と「その対象テキスト」が
+1行に混在していることがあります。まず両者を切り分け、指示を対象テキストに
+適用した結果を返してください。
+
+例:
+  stdin: 'into japanese how are you?'
+    → 指示 = 日本語に訳す / 対象 = 'how are you?' → 出力: 'お元気ですか？'
+  stdin: 'make it concise under 10 strings 今日は天気が良いですね御機嫌如何ですか'
+    → 指示 = 10文字以内に短縮 / 対象 = '今日は天気が良いですね御機嫌如何ですか'
+
+規則:
+- 対象テキストが見当たらず、依頼そのものが質問である場合は、その質問に答える。
+- 出力言語は依頼の内容に従う。明示が無ければ対象テキストの言語を保つ。
+- 文字数・語数の制約が指示されている場合は必ず守る。"
+
+if ${VERBOSE}; then
+    PROMPT+="
+- 必要に応じて簡単な補足説明を添えてよい。"
+else
+    PROMPT+="
+- 出力は結果テキストのみ。前置き・後書き・言い換えの候補列挙・
+  「以下が結果です」等の説明・コードブロックや引用符での囲みは一切書かない。
+- 依頼の復唱もしない。結果だけを1回出力して終わる。"
+fi
+
+# ---- バックエンド選択 ----
+if ${USE_CODEX}; then
+    AGENT="$(dirname "${BASH_SOURCE[0]}")/codex-stdin-prompt"
+    # codex は config.toml の既定に任せず、luna を明示指定する。
+    if [[ -z "${MODEL}" ]]; then
+        MODEL="${CODEX_DEFAULT_MODEL}"
+    fi
+    # 短縮名を正式なスラッグへ解決する（'luna' -> 'gpt-5.6-luna'）。
+    case "${MODEL}" in
+        luna)  MODEL="gpt-5.6-luna" ;;
+        terra) MODEL="gpt-5.6-terra" ;;
+    esac
+else
+    AGENT="$(dirname "${BASH_SOURCE[0]}")/claude-stdin-prompt"
+    # claude 側のデフォルトは sonnet なので、最安の haiku に上書きする。
+    if [[ -z "${MODEL}" ]]; then
+        MODEL="${CLAUDE_DEFAULT_MODEL}"
+    fi
+fi
+
+[[ -x "${AGENT}" ]] || { echo "Error: agent not found or not executable: ${AGENT}" >&2; exit 1; }
+
+AGENT_ARGS=(-p "${PROMPT}")
+if [[ -n "${MODEL}" ]]; then
+    AGENT_ARGS+=(--model "${MODEL}")
+fi
+
+# ---- 呼び出し ----
+# バックエンドは stdin 必須なので、依頼文を stdin として渡す。
+echo "${REQUEST}" | "${AGENT}" "${AGENT_ARGS[@]}"
