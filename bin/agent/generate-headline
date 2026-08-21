@@ -4,25 +4,38 @@
 # Revised: 2026-06-02
 # Script: generate-headline
 # Description:
-#   入力テキストを3つの方向性（短縮・体言止め・スライド見出し）で言い換える。
-#   バックエンドに claude-stdin-prompt または codex-stdin-prompt を使用する。
+#   Rephrase the input text in three different directions: shortened,
+#   tightened with a noun-phrase ending (体言止め), and slide-headline style.
+#   Uses claude-stdin-prompt or codex-stdin-prompt as the backend.
 #
 #   echo "要約したい文章" | generate-headline
 #   generate-headline "要約したい文章"
 #   generate-headline < input.txt
 #   echo "テキスト" | generate-headline --codex --model o4-mini
 #
+#   Steps:
+#     1. Parse options and take the input text from an argument or stdin.
+#     2. Build a prompt requesting N candidates for each of the three
+#        directions, in a fixed markdown layout.
+#     3. Pass the input to the backend (claude|codex) on stdin and run it.
+#
 # Options:
-#   --codex                   codex-stdin-prompt を使用 (デフォルト: claude-stdin-prompt)
-#   --model, -m <model>       使用するモデル
-#                             claude 時のデフォルト: sonnet
-#                             codex 時のデフォルト: (codex のデフォルト)
-#   --candidate, -n <number>  各方向の提案数 (デフォルト: 3)
-#   -h, --help                このヘルプを表示
+#   --codex                   Use codex-stdin-prompt (default: claude-stdin-prompt)
+#   --model, -m <model>       Model to use
+#                             claude default: sonnet
+#                             codex default: (codex's own default)
+#   --candidate, -n <number>  Candidates per direction (default: 3)
+#   -h, --help                Show this help message
+#
+# Usage:
+#   generate-headline [options] TEXT
+#   <command> | generate-headline [options]
 #
 # Notes:
-#   - 引数として入力テキストを渡すか、stdin からパイプ/リダイレクトで与える。
-#   - --codex 時は stdin を TTY から起動しないこと（codex の制約）。
+#   - Supply the input text either as an argument or via a pipe/redirect on
+#     stdin.
+#   - With --codex, do not start it with stdin attached to a TTY (a codex
+#     constraint).
 #   - Sources '../../lib/docstring.sh' for usage_helper.
 # -----------------------------------------------------------------------------
 

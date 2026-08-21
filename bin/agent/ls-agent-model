@@ -4,58 +4,62 @@
 # Revised: 2026-08-20
 # Script: ls-agent-model
 # Description:
-#   コーディングエージェントで利用可能なモデルの一覧を表示する．デフォルトは
-#   codex CLI が報告するモデルの slug のみを1行1件で出力し，--json を付けると
-#   config/agent_model_cost.yml の token 単価を結合した JSON を出力する
-#   （単位は各モデルの cost_type フィールドに入る）．
+#   List the models available to coding agents. By default it prints only the
+#   model slugs reported by the codex CLI, one per line; with --json it prints
+#   JSON that joins in the token prices from config/agent_model_cost.yml (the
+#   unit lands in each model's cost_type field).
 #
-#     ls-agent-model              # slug のみ
-#     ls-agent-model --json       # slug + 単価 + 価格メタ情報 (JSON)
-#     ls-agent-model -a           # hide 扱いのモデルも含める
+#     ls-agent-model              # slugs only
+#     ls-agent-model --json       # slug + prices + pricing metadata (JSON)
+#     ls-agent-model -a           # include models marked as hidden
 #
 #   Steps:
-#     1. オプションを解析し，対象プロバイダ (codex|claude) を決める．
-#     2. 'codex debug models --bundled' から利用可能な slug を取得する．
-#     3. --json 指定時は config/agent_model_cost.yml の単価を slug で結合し，
-#        価格区分・取得日・出典とあわせて JSON で出力する．
+#     1. Parse options and determine the target provider (codex|claude).
+#     2. Collect the available slugs from 'codex debug models --bundled'.
+#     3. With --json, join the prices from config/agent_model_cost.yml on slug
+#        and emit JSON alongside the pricing tier, retrieval date, and source.
 #
 # Options:
-#   -a, --all         codex が 'hide' 扱いにしているモデルも一覧に含める
-#   -j, --json        単価と価格メタ情報 (tier / 取得日 / 出典) を含む
-#                     JSON を出力する
-#   --claude          Claude のモデルを対象にする (未実装)
-#   -v, --version     バージョンを表示して終了
-#   -h, --help        このヘルプを表示して終了
+#   -a, --all         Include models that codex marks as 'hide'
+#   -j, --json        Emit JSON including prices and pricing metadata
+#                     (tier / retrieval date / source)
+#   --claude          Target Claude models (not implemented)
+#   -v, --version     Print the version and exit
+#   -h, --help        Show this help message and exit
 #
 # Usage:
 #   ls-agent-model [options]
 #
-#   ls-agent-model                # 利用可能な slug を列挙
-#   ls-agent-model --json         # 単価付き JSON
-#   ls-agent-model -aj            # hide 込みで単価付き JSON
+#   ls-agent-model                # enumerate the available slugs
+#   ls-agent-model --json         # JSON with prices
+#   ls-agent-model -aj            # JSON with prices, hidden models included
 #
-#   # jq で任意の形に整形する（表示整形はこのスクリプトでは行わない）
+#   # Reshape freely with jq (this script does no display formatting)
 #   ls-agent-model --json | jq -r '.models[] | [.slug, .price.short.input] | @tsv'
 #
 # Notes:
 #   - Requires 'codex', 'yamlcli', 'jq'.
-#   - 「利用可能なモデル」の情報源は codex CLI，「単価」の情報源は
-#     config/agent_model_cost.yml であり，両者は slug で結合される．
-#     このため CLI が返すのに単価が未掲載のモデルは price が空になり，
-#     単価表にあるが CLI が返さないモデルは一覧に現れない．
-#   - price のネスト構造は config の記述をそのまま返す．プロバイダごとに
-#     価格表の形が違う（OpenAI は short/long context の2階層，Anthropic は
-#     input/output のフラット構造）ため，構造は解釈も正規化もしない．
-#   - 単価の単位は各モデルの cost_type に入れる（例 "USD / 1M tokens"）．
-#     config のモデルに cost_type があればそれを，無ければ provider の
-#     unit を使う．解決済みの値が入るので利用側での分岐は不要．
-#   - JSON にはこのほか価格区分 (pricing_tier)，価格を転記した日付
-#     (retrieved)，出典 URL (source) を含める．いずれも config の値をその
-#     まま出す．価格は改定されるため，課金の根拠には必ず出典 URL を参照
-#     すること．
-#   - --claude は将来対応予定で，現状は指定するとエラー終了する．
+#   - "Available models" comes from the codex CLI and "prices" come from
+#     config/agent_model_cost.yml; the two are joined on slug. A model the CLI
+#     returns but the price table omits therefore gets an empty price, and a
+#     model in the price table that the CLI does not return never appears in
+#     the listing.
+#   - The nested structure under price is returned exactly as written in the
+#     config. Price tables differ in shape per provider (OpenAI has two levels
+#     for short/long context, Anthropic is flat input/output), so the structure
+#     is neither interpreted nor normalized.
+#   - The price unit goes in each model's cost_type (e.g. "USD / 1M tokens").
+#     A model's own cost_type in the config wins; otherwise the provider's unit
+#     is used. The value is already resolved, so callers need no branching.
+#   - The JSON also carries the pricing tier (pricing_tier), the date the
+#     prices were transcribed (retrieved), and the source URL (source), all
+#     emitted verbatim from the config. Prices get revised, so always consult
+#     the source URL as the basis for any billing claim.
+#   - --claude is planned for a future release; specifying it currently exits
+#     with an error.
 #   - The config file is resolved relative to this script
-#     (config/agent_model_cost.yml)．CONFIG_FILE 環境変数で上書き可能．
+#     (config/agent_model_cost.yml). It can be overridden with the CONFIG_FILE
+#     environment variable.
 #   - Sources '../../lib/docstring.sh' and '../../lib/version.sh'.
 # -----------------------------------------------------------------------------
 

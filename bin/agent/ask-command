@@ -4,33 +4,34 @@
 # Revised: 2026-08-20
 # Script: ask-command
 # Description:
-#   任意の CLI コマンドの概要を「動作 / syntax / frequently used options /
-#   examples」の4節に絞って簡潔に解説させる。バックエンドに
-#   claude-stdin-prompt または codex-stdin-prompt を使用する。
+#   Explain an arbitrary CLI command concisely, restricted to four sections:
+#   behaviour / syntax / frequently used options / examples. Uses
+#   claude-stdin-prompt or codex-stdin-prompt as the backend.
 #
 #     ask-command git stash
 #     ask-command --model opus4.8 rsync
 #     ask-command --codex "docker compose up"
-#     ask-command -n 5 jq            # examples を5件に増やす
+#     ask-command -n 5 jq            # raise the example count to 5
 #
-#   引数は連結して1つのコマンド文字列として扱われるため、
-#   'ask-command git stash' と 'ask-command "git stash"' は等価。
+#   All arguments are concatenated into a single command string, so
+#   'ask-command git stash' and 'ask-command "git stash"' are equivalent.
 #
 #   Steps:
-#     1. オプションを解析し、対象コマンド文字列を組み立てる。
-#     2. 4節構成を指示するプロンプトを生成する。
-#     3. バックエンド (claude|codex) にコマンド名を stdin として渡し実行する。
+#     1. Parse options and assemble the target command string.
+#     2. Build a prompt that dictates the four-section structure.
+#     3. Pass the command name to the backend (claude|codex) on stdin and run it.
 #
 # Options:
-#   --codex                   codex-stdin-prompt を使用 (デフォルト: claude-stdin-prompt)
-#   --model, -m <model>       使用するモデル
-#                             claude 時のデフォルト: haiku
-#                             codex 時のデフォルト: gpt-5.6-luna
-#                             codex では短縮名も可: 'luna' / 'terra'
-#   --example, -n <number>    examples の件数 (デフォルト: 3)
-#   --lang, -l <lang>         出力言語 (デフォルト: ja)
-#   -h, --help                このヘルプを表示
-#   --                        以降をコマンド文字列として扱う (先頭が '-' のとき用)
+#   --codex                   Use codex-stdin-prompt (default: claude-stdin-prompt)
+#   --model, -m <model>       Model to use
+#                             claude default: haiku
+#                             codex default: gpt-5.6-luna
+#                             codex also accepts short names: 'luna' / 'terra'
+#   --example, -n <number>    Number of examples (default: 3)
+#   --lang, -l <lang>         Output language (default: ja)
+#   -h, --help                Show this help message
+#   --                        Treat everything after this as the command
+#                             string (for commands starting with '-')
 #
 # Usage:
 #   ask-command [options] COMMAND [ARGS...]
@@ -38,18 +39,19 @@
 #   ask-command git stash
 #   ask-command --model opus4.8 git rebase
 #   ask-command --codex awk                 # codex + gpt-5.6-luna
-#   ask-command --codex --model terra awk   # 短縮名で terra を指定
+#   ask-command --codex --model terra awk   # select terra by its short name
 #   ask-command --lang en -n 5 find
-#   ask-command -- --version              # '--' で先頭 '-' を保護
+#   ask-command -- --version              # '--' protects a leading '-'
 #
 # Notes:
-#   - 解説はモデルの知識に基づく生成物であり、手元の実装／バージョンとの
-#     差異がありうる。正確な仕様は 'man' や '--help' を参照すること。
-#   - デフォルトは claude + haiku（速度重視）。精度が要るときは
-#     --model opus4.8 等を指定する。
-#   - --codex 時は gpt-5.6-luna を明示指定する（~/.codex/config.toml の
-#     既定には依存しない）。ChatGPT アカウント認証では 'gpt-5' 系は
-#     利用できないため、gpt-5.6-* / gpt-5.5 / gpt-5.4-mini を使うこと。
+#   - The explanation is generated from the model's knowledge and may differ
+#     from the implementation/version installed locally. Consult 'man' or
+#     '--help' for the authoritative specification.
+#   - The default is claude + haiku (favouring speed). When accuracy matters,
+#     specify something like --model opus4.8.
+#   - With --codex, gpt-5.6-luna is passed explicitly (it does not rely on the
+#     default in ~/.codex/config.toml). ChatGPT account authentication cannot
+#     use the 'gpt-5' family, so use gpt-5.6-* / gpt-5.5 / gpt-5.4-mini.
 #   - Sources '../../lib/docstring.sh' for usage_helper.
 # -----------------------------------------------------------------------------
 
