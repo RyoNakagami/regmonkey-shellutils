@@ -127,6 +127,7 @@ done
 **遵守ルール**:
 
 - `set -euo pipefail` を必ず付ける．
+- docstringは原則English
 - `lib/docstring.sh` を必ず source する．`-h` は `usage_helper` を呼ぶだけにする（再実装しない）．
 - 既存 lib に同等のヘルパがあれば再利用する．汎用化できる新ヘルパが出てきたら `lib/` に追加して両方から source する（script 内に閉じ込めない）．
 - エラーは `stderr` に `Error: <理由>` の形で出す．終了コードは非ゼロ．
