@@ -1,0 +1,205 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-10-13
+# Script: filtergrep
+# Description:
+#   grep with file-glob and line-range filtering. Lists the files under PATH
+#   whose name matches a glob and which contain PATTERN within a given range
+#   of line numbers. Matching is done by a single 'find ... -exec awk ... {} +'
+#   so that no process is spawned per file.
+#
+#   Steps:
+#     1. Parse command-line options and the PATTERN / PATH arguments.
+#     2. Validate dependencies, PATH existence and the line range.
+#     3. Run 'find PATH -type f -name GLOB -exec awk ... {} +', where awk
+#        prints FILENAME on the first match inside [start, end] and skips to
+#        the next file as soon as a match is found or 'end' is passed.
+#
+# Options:
+#    --include <glob>  Only search files whose basename matches <glob>
+#                      (default: '*'). '--include=<glob>' is also accepted.
+#    --start <num>     First line number to search (default: 1)
+#    --end <num>       Last line number to search (default: end of file)
+#    -F                Treat PATTERN as a fixed string, not a regex
+#    -i                Ignore case
+#    -h                Show this help message
+#
+# Usage:
+#   ./filtergrep 'Author:' bin --end 5
+#   ./filtergrep 'TODO|FIXME' . --include='*.py' --start 10 --end 50
+#   ./filtergrep -F -i 'a.b(' src --include '*.sh'
+#   ./filtergrep --end 3 -- '-euo pipefail' bin
+#
+# Notes:
+#   - Requires 'find' and 'awk' on PATH.
+#   - PATTERN is an extended regular expression (like 'grep -E'), because it
+#     is evaluated by awk. Use -F for a literal string.
+#   - Exits 0 even when no file matches (unlike grep).
+#   - Sources '../../lib/docstring.sh' for usage_helper.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ---- Load dependencies ----
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+
+# ---- Default values ----
+INCLUDE='*'
+START=1
+END=""
+FIXED=false
+ICASE=false
+POSITIONAL=()
+
+# ---- Parse options ----
+require_value() {
+  if [[ $# -lt 2 ]]; then
+    echo "Error: $1 requires a value." >&2
+    exit 1
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h)
+      usage_helper
+      exit 0
+      ;;
+    --include=*)
+      INCLUDE="${1#--include=}"
+      shift
+      ;;
+    --include)
+      require_value "$@"
+      INCLUDE="$2"
+      shift 2
+      ;;
+    --start=*)
+      START="${1#--start=}"
+      shift
+      ;;
+    --start)
+      require_value "$@"
+      START="$2"
+      shift 2
+      ;;
+    --end=*)
+      END="${1#--end=}"
+      shift
+      ;;
+    --end)
+      require_value "$@"
+      END="$2"
+      shift 2
+      ;;
+    -F)
+      FIXED=true
+      shift
+      ;;
+    -i)
+      ICASE=true
+      shift
+      ;;
+    --)
+      shift
+      POSITIONAL+=("$@")
+      break
+      ;;
+    -*)
+      echo "Error: unknown option: $1" >&2
+      usage_helper
+      exit 1
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# ---- Validate dependencies ----
+for cmd in find awk; do
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    echo "Error: '${cmd}' is not installed or not on PATH." >&2
+    exit 1
+  fi
+done
+
+# ---- Validate arguments ----
+if [[ ${#POSITIONAL[@]} -lt 2 ]]; then
+  echo "Error: PATTERN and PATH are required." >&2
+  usage_helper
+  exit 1
+fi
+
+if [[ ${#POSITIONAL[@]} -gt 2 ]]; then
+  echo "Error: only PATTERN and PATH are accepted (got extra: ${POSITIONAL[2]})" >&2
+  exit 1
+fi
+
+PATTERN="${POSITIONAL[0]}"
+TARGET="${POSITIONAL[1]}"
+
+if [[ ! -e "${TARGET}" ]]; then
+  echo "Error: path does not exist: ${TARGET}" >&2
+  exit 1
+fi
+
+if [[ -z "${INCLUDE}" ]]; then
+  echo "Error: --include must not be empty." >&2
+  exit 1
+fi
+
+# ---- Validate line range ----
+if ! [[ "${START}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Error: --start must be a positive integer (got: ${START})" >&2
+  exit 1
+fi
+
+if [[ -n "${END}" ]]; then
+  if ! [[ "${END}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: --end must be a positive integer (got: ${END})" >&2
+    exit 1
+  fi
+  if (( START > END )); then
+    echo "Error: --start (${START}) must be <= --end (${END})" >&2
+    exit 1
+  fi
+fi
+
+# ---- Build awk program ----
+# The match expression is chosen here so awk evaluates no mode branch per line.
+BEGIN_BLOCK='pat = ENVIRON["FILTERGREP_PATTERN"]'
+LINE='$0'
+
+if ${ICASE}; then
+  # gawk has IGNORECASE; lower-casing a regex would corrupt escapes such as \S.
+  if ! ${FIXED} && awk --version </dev/null 2>/dev/null | grep -q 'GNU Awk'; then
+    BEGIN_BLOCK+='; IGNORECASE = 1'
+  else
+    BEGIN_BLOCK+='; pat = tolower(pat)'
+    LINE='tolower($0)'
+  fi
+fi
+
+if ${FIXED}; then
+  MATCH="(pat == \"\" || index(${LINE}, pat))"
+else
+  MATCH="${LINE} ~ pat"
+fi
+
+PROGRAM="BEGIN { ${BEGIN_BLOCK} }"
+if [[ -n "${END}" ]]; then
+  PROGRAM+=" FNR > ${END} { nextfile }"
+fi
+PROGRAM+=" FNR >= ${START} && ${MATCH} { print FILENAME; nextfile }"
+
+# A leading '-' would be parsed by find as an expression.
+if [[ "${TARGET}" == -* ]]; then
+  TARGET="./${TARGET}"
+fi
+
+# ---- Run ----
+FILTERGREP_PATTERN="${PATTERN}" \
+  find "${TARGET}" -type f -name "${INCLUDE}" -exec awk "${PROGRAM}" {} +
