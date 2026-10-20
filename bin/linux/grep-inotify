@@ -1,0 +1,208 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-10-20
+# Script: grep-inotify
+# Description:
+#   Group a process's watched directories by depth relative to a search root.
+#
+#   Steps:
+#     1. Extract and deduplicate hexadecimal inodes from inotify fdinfo lines.
+#     2. Scan directories with find -xdev and match their decimal inode numbers.
+#     3. Group paths by depth; sort by count descending, then path ascending.
+#     4. Output TSV or JSON and print an inode summary to stderr.
+#
+# Options:
+#   -d N, --depth N   Group at N levels below the root (default: 3; positive)
+#   -n N             Show the top N groups (default: 20; 0 means all)
+#   --all            Show all groups
+#   -r DIR, --root DIR
+#                    Search below DIR (default: $HOME)
+#   --json           Output a JSON array instead of TSV
+#   -h, --help       Show this help message
+#
+# Usage:
+#   grep-inotify 15131
+#   grep-inotify -r /home/user -d 2 -n 10 15131
+#   sudo grep-inotify --root /home/user --all --json 15131
+#
+# Notes:
+#   - Requires Bash 4+, GNU coreutils/findutils, and awk; no jq dependency.
+#   - find scans the entire root filesystem subtree; large trees take time.
+#   - sudo is required to inspect another user's process.
+#   - The root is resolved to an absolute physical path. Symlinks are not followed.
+#   - Shallower paths, including the root itself, retain their full path.
+#   - The summary counts unique inodes before limiting output. Missing inodes
+#     can be outside the root, on another filesystem, or watches on files.
+#   - Matching uses inode numbers only, which are not globally unique across
+#     filesystems. A live scan is not an atomic snapshot.
+#   - TSV escapes backslashes, tabs, CR, and LF as \\, \t, \r, \n.
+#   - Unreadable fdinfo or an incomplete directory scan is an error (exit 1).
+#   - GREP_INOTIFY_PROC_ROOT overrides /proc for fixtures or another proc mount.
+#   - Sources '../../lib/docstring.sh' and '../../lib/json.sh'.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+shopt -s nullglob extglob
+
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/json.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/json.sh"
+
+depth=3
+limit=20
+root="${HOME:-}"
+json=0
+pid=''
+proc_root="${GREP_INOTIFY_PROC_ROOT:-/proc}"
+
+argument_error() {
+  printf 'Error: %s\n' "$1" >&2
+  usage_helper "$0" >&2
+  exit 2
+}
+
+fail() {
+  printf 'Error: %s\n' "$1" >&2
+  exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage_helper "$0"; exit 0 ;;
+    -d|--depth|-n)
+      option="$1"
+      [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] ||
+        argument_error "${option} requires an integer"
+      number="${2##+(0)}"
+      number="${number:-0}"
+      if [[ "${option}" == -n ]]; then
+        # Such a limit exceeds any feasible number of paths; avoid overflow.
+        if [[ ${#number} -gt 18 ]]; then limit=0; else limit="${number}"; fi
+      else
+        [[ "${number}" != 0 ]] || argument_error "${option} requires a positive integer"
+        if [[ ${#number} -gt 9 ]]; then depth=2147483647; else depth="${number}"; fi
+      fi
+      shift 2
+      ;;
+    -r|--root)
+      [[ $# -ge 2 && -n "$2" ]] || argument_error "$1 requires a directory"
+      root="$2"
+      shift 2
+      ;;
+    --all) limit=0; shift ;;
+    --json) json=1; shift ;;
+    --)
+      shift
+      [[ $# -le 1 && -z "${pid}" ]] || argument_error 'expected one PID'
+      if [[ $# == 1 ]]; then pid="$1"; shift; fi
+      ;;
+    -*) argument_error "unknown option: $1" ;;
+    *)
+      [[ -z "${pid}" ]] || argument_error 'expected one PID'
+      pid="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -n "${pid}" ]] || fail 'PID is required'
+[[ "${pid}" =~ ^[0-9]+$ ]] || fail "PID must be numeric: ${pid}"
+pid="${pid##+(0)}"
+pid="${pid:-0}"
+[[ -d "${proc_root}/${pid}" ]] || fail "process does not exist: ${pid}"
+fdinfo="${proc_root}/${pid}/fdinfo"
+[[ -d "${fdinfo}" && -r "${fdinfo}" && -x "${fdinfo}" ]] ||
+  fail "cannot read fdinfo for PID ${pid} (try sudo)"
+
+for dependency in awk cat find mktemp rm sort; do
+  command -v "${dependency}" >/dev/null 2>&1 ||
+    fail "required command not found: ${dependency}"
+done
+[[ -d "${root}" && -r "${root}" && -x "${root}" ]] ||
+  fail "cannot read search root: ${root}"
+root=$(cd -P -- "${root}" && printf '%s.' "${PWD}") ||
+  fail "cannot resolve search root: ${root}"
+root="${root%.}"
+
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/grep-inotify.XXXXXXXXXX") ||
+  fail 'cannot create temporary directory'
+trap 'rm -rf -- "${work_dir}"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+: > "${work_dir}/fdinfo"
+for file in "${fdinfo}"/*; do
+  cat -- "${file}" >> "${work_dir}/fdinfo" 2>/dev/null ||
+    fail "cannot read fdinfo for PID ${pid}: ${file} (process exited or permission denied)"
+done
+[[ -d "${fdinfo}" ]] || fail "process exited during fdinfo scan: ${pid}"
+awk '/^inotify/ {
+  for (i = 1; i <= NF; i++)
+    if ($i ~ /^ino:[[:xdigit:]]+$/) print substr($i, 5)
+}' "${work_dir}/fdinfo" > "${work_dir}/hex-inodes"
+
+declare -A watched=() found=() groups=()
+while IFS= read -r hex; do
+  # Bash printf preserves all 64 inode bits; awk numbers can lose precision.
+  printf -v inode '%u' "0x${hex}" 2>/dev/null ||
+    fail "invalid inode in fdinfo: ${hex}"
+  watched["${inode}"]=1
+done < "${work_dir}/hex-inodes"
+
+if [[ ${#watched[@]} -gt 0 ]]; then
+  if ! find "${root}" -xdev -type d -printf '%i\0%p\0' \
+    > "${work_dir}/directories" 2> "${work_dir}/find-errors"; then
+    cat "${work_dir}/find-errors" >&2
+    fail "directory scan incomplete: ${root}"
+  fi
+  while IFS= read -r -d '' inode && IFS= read -r -d '' path; do
+    [[ -n "${watched[${inode}]:-}" ]] || continue
+    found["${inode}"]=1
+    group="${root}"
+    if [[ "${path}" != "${root}" ]]; then
+      relative="${path#"${root%/}/"}"
+      for ((level = 0; level < depth; level++)); do
+        component="${relative%%/*}"
+        group="${group%/}/${component}"
+        [[ "${relative}" == */* ]] || break
+        relative="${relative#*/}"
+      done
+    fi
+    groups["${group}"]=$(( ${groups["${group}"]:-0} + 1 ))
+  done < "${work_dir}/directories"
+fi
+
+# NUL-delimited sorting preserves tabs and newlines in real directory names.
+{
+  for path in "${!groups[@]}"; do
+    printf '%s\t%s\0' "${groups["${path}"]}" "${path}"
+  done
+} | LC_ALL=C sort -z -t $'\t' -k1,1nr -k2 > "${work_dir}/groups"
+
+shown=0
+if [[ "${json}" == 1 ]]; then printf '['; else printf 'COUNT\tPATH\n'; fi
+while IFS= read -r -d '' row; do
+  if (( limit != 0 && shown >= limit )); then break; fi
+  count="${row%%$'\t'*}"
+  path="${row#*$'\t'}"
+  if [[ "${json}" == 1 ]]; then
+    if (( shown > 0 )); then printf ', '; fi
+    printf '{"count": %s, "path": ' "${count}"
+    json_quote "${path}"
+    printf '}'
+  else
+    path="${path//\\/\\\\}"
+    path="${path//$'\t'/\\t}"
+    path="${path//$'\r'/\\r}"
+    path="${path//$'\n'/\\n}"
+    printf '%s\t%s\n' "${count}" "${path}"
+  fi
+  shown=$((shown + 1))
+done < "${work_dir}/groups"
+if [[ "${json}" == 1 ]]; then printf ']\n'; fi
+printf 'Watched inodes: %s; found: %s; not found: %s (outside root, another filesystem, or file watches)\n' \
+  "${#watched[@]}" "${#found[@]}" "$(( ${#watched[@]} - ${#found[@]} ))" >&2

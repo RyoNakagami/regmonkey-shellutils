@@ -1,0 +1,152 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Author: Ryo Nakagami
+# Revised: 2026-10-20
+# Script: inotify-top
+# Description:
+#   Display inotify watches per process, sorted by watches descending and PID
+#   ascending. Only processes with at least one readable watch are included.
+#
+#   Steps:
+#     1. Count lines starting with "inotify" in each process's fdinfo files.
+#     2. Read the process name and optional command line.
+#     3. Sort, limit, and output TSV or a JSON array.
+#
+# Options:
+#   -n N          Show the top N processes (default: 20; 0 means all)
+#   --all         Show all processes
+#   --json        Output a JSON array instead of TSV
+#   --cmd         Add CMD / "cmd": replace NUL with spaces, keep 200 characters
+#   -h, --help    Show this help message
+#
+# Usage:
+#   inotify-top
+#   inotify-top -n 10 --cmd
+#   inotify-top --all --json
+#
+# Notes:
+#   - Requires Linux /proc, Bash, coreutils, grep, and awk; no jq dependency.
+#   - Run with sudo to include other users' processes: sudo inotify-top
+#   - Unreadable or exited processes/files are silently skipped.
+#   - This is a live scan, not an atomic snapshot. Shared watches can appear
+#     under multiple processes or file descriptors.
+#   - TSV escapes backslashes, tabs, CR, and LF inside APP/CMD as \\, \t, \r, \n.
+#   - INOTIFY_TOP_PROC_ROOT overrides /proc (for fixtures or another proc mount).
+#   - If repeated, -n / --all use the last supplied value.
+#   - Sources '../../lib/docstring.sh' and '../../lib/json.sh'.
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/docstring.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/docstring.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../lib/json.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/json.sh"
+
+limit=20
+json=0
+with_cmd=0
+proc_root="${INOTIFY_TOP_PROC_ROOT:-/proc}"
+
+argument_error() {
+  printf 'Error: %s\n' "$1" >&2
+  usage_helper "$0" >&2
+  exit 2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage_helper "$0"; exit 0 ;;
+    -n)
+      [[ $# -ge 2 ]] || argument_error '-n requires a non-negative integer'
+      [[ "$2" =~ ^[0-9]+$ ]] || argument_error '-n requires a non-negative integer'
+      limit="$2"
+      shift 2
+      ;;
+    --all) limit=0; shift ;;
+    --json) json=1; shift ;;
+    --cmd) with_cmd=1; shift ;;
+    *) argument_error "unexpected argument: $1" ;;
+  esac
+done
+
+for dependency in cat grep awk sort tr; do
+  if ! command -v "${dependency}" >/dev/null 2>&1; then
+    printf 'Error: required command not found: %s\n' "${dependency}" >&2
+    exit 1
+  fi
+done
+if [[ ! -d "${proc_root}" || ! -r "${proc_root}" || ! -x "${proc_root}" ]]; then
+  printf 'Error: cannot read proc directory: %s\n' "${proc_root}" >&2
+  exit 1
+fi
+
+collect_processes() {
+  local process pid watches app cmd value
+  local -a values
+  for process in "${proc_root}"/[0-9]*; do
+    pid="${process##*/}"
+    [[ "${pid}" =~ ^[0-9]+$ && -d "${process}/fdinfo" ]] || continue
+    [[ -r "${process}/fdinfo" && -x "${process}/fdinfo" ]] || continue
+    watches=$(
+      { grep -h -c '^inotify' "${process}"/fdinfo/* 2>/dev/null || :; } |
+        awk '{ total += $0 } END { print total + 0 }'
+    )
+    [[ "${watches}" -gt 0 ]] || continue
+    # A sentinel preserves embedded/trailing newlines in the process name.
+    app=$(cat "${process}/comm" 2>/dev/null && printf '.') || continue
+    app="${app%.}"
+    app="${app%$'\n'}"
+    cmd=''
+    if [[ "${with_cmd}" == 1 ]]; then
+      cmd=$({ tr '\000' ' ' < "${process}/cmdline" && printf '.'; } 2>/dev/null) || continue
+      cmd="${cmd%.}"
+      cmd="${cmd:0:200}"
+    fi
+    [[ -d "${process}" ]] || continue
+    printf '%s\t%s\t' "${watches}" "${pid}"
+    if [[ "${json}" == 1 ]]; then
+      printf '{"pid": %s, "watches": %s, "app": ' "${pid}" "${watches}"
+      json_quote "${app}"
+      if [[ "${with_cmd}" == 1 ]]; then
+        printf ', "cmd": '
+        json_quote "${cmd}"
+      fi
+      printf '}\n'
+    else
+      printf '%s\t%s' "${pid}" "${watches}"
+      values=("${app}")
+      if [[ "${with_cmd}" == 1 ]]; then
+        values+=("${cmd}")
+      fi
+      for value in "${values[@]}"; do
+        value="${value//\\/\\\\}"
+        value="${value//$'\t'/\\t}"
+        value="${value//$'\r'/\\r}"
+        value="${value//$'\n'/\\n}"
+        printf '\t%s' "${value}"
+      done
+      printf '\n'
+    fi
+  done
+}
+
+# Consume the entire sorted stream so a small limit cannot cause SIGPIPE.
+collect_processes |
+  LC_ALL=C sort -t $'\t' -k1,1nr -k2,2n |
+  awk -v limit="${limit}" -v json="${json}" -v with_cmd="${with_cmd}" '
+    BEGIN {
+      if (json) printf "["
+      else print "PID\tWATCHES\tAPP" (with_cmd ? "\tCMD" : "")
+    }
+    limit == 0 || NR <= limit {
+      row = substr($0, index($0, "\t") + 1)
+      row = substr(row, index(row, "\t") + 1)
+      if (json) {
+        printf "%s%s", (count++ ? ", " : ""), row
+      } else print row
+    }
+    END { if (json) print "]" }
+  '
